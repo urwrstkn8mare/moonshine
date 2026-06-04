@@ -88,7 +88,9 @@ mio = { version = "1.1.1", features = ["net", "os-ext", "os-poll"] }
 mio-timerfd = "0.2.0"
 
 # Session (control stream)
-tokio-enet = "0.1.0"
+# Fork adding `replace_peer_when_full` (hgaiser/tokio-enet#2) so a reconnecting client
+# takes over the single peer slot instead of being refused.
+tokio-enet = { git = "https://github.com/urwrstkn8mare/tokio-enet", rev = "f67c13fbf0ed7baaf491d71119cb93a70968ad5c" }
 inputtino = { version = "0.1.0", git = "https://github.com/games-on-whales/inputtino" }
 crossbeam-channel = "0.5.15"
 bitflags = "2.9.4"
