@@ -1914,7 +1914,7 @@ dependencies = [
 [[package]]
 name = "inputtino"
 version = "0.1.0"
-source = "git+https://github.com/games-on-whales/inputtino#f4ce2b0df536ef309e9ff318f75b460f7097d7c1"
+source = "git+https://github.com/urwrstkn8mare/inputtino?rev=118fc5db9619cd43bb9deba1520e557751656faa#118fc5db9619cd43bb9deba1520e557751656faa"
 dependencies = [
  "inputtino-sys",
 ]
@@ -1922,7 +1922,7 @@ dependencies = [
 [[package]]
 name = "inputtino-sys"
 version = "0.1.0"
-source = "git+https://github.com/games-on-whales/inputtino#f4ce2b0df536ef309e9ff318f75b460f7097d7c1"
+source = "git+https://github.com/urwrstkn8mare/inputtino?rev=118fc5db9619cd43bb9deba1520e557751656faa#118fc5db9619cd43bb9deba1520e557751656faa"
 dependencies = [
  "bindgen",
  "cmake",
