@@ -284,7 +284,15 @@ impl ControlStream {
 		let host_config = HostConfig {
 			address: Some(socket_address),
 			peer_count: 1,
-			channel_limit: 1,
+			// Moonlight maps each input type onto its own ENet channel (keyboard,
+			// mouse, pen, touch, plus a channel per gamepad/sensor) on top of the
+			// generic/urgent control channels. With a single channel, all of this
+			// reliable-ordered traffic shares one stream, so one lost datagram
+			// head-of-line blocks every later input until ENet retransmits it
+			// (hundreds of ms under loss) — felt as input briefly "sticking".
+			// Sunshine hands ENet the maximum (255); match it so each input type
+			// gets an independent channel and losses stay isolated.
+			channel_limit: 255,
 			// Single-client server: when a client reconnects (e.g. after an abrupt
 			// disconnect whose stale peer hasn't timed out yet), let the new connection
 			// reset the old peer and take over the slot instead of being refused.
