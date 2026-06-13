@@ -97,7 +97,7 @@ quinn-udp = "0.6"
 tokio-enet = { git = "https://github.com/urwrstkn8mare/tokio-enet", rev = "f67c13fbf0ed7baaf491d71119cb93a70968ad5c" }
 # Fork adding a DualShock 4 (PS4) uhid joypad (Joypad::PS4) so PlayStation pads
 # can be emulated as a DS4 instead of a DualSense, giving full classic rumble.
-inputtino = { version = "0.1.0", git = "https://github.com/urwrstkn8mare/inputtino", rev = "13718df305947c246acebab36ac6ddabe78b7fb5" }
+inputtino = { version = "0.1.0", git = "https://github.com/urwrstkn8mare/inputtino", rev = "3a56672fe4c569e16f71e55d5731c33591f30bc8" }
 crossbeam-channel = "0.5.15"
 bitflags = "2.9.4"
 
