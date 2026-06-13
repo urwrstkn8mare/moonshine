@@ -332,7 +332,10 @@ impl Gamepad {
 			// to emulate the matching pad — the DS4 gives stronger rumble since games
 			// drive its motors directly instead of routing feedback to DualSense haptics.
 			GamepadKind::PlayStation if !info.has_capability(&GamepadCapability::TriggerRumble) => {
-				DeviceDefinition::new("Moonshine PS4 controller", 0x054C, 0x05C4, 0x8111, id.as_str(), id.as_str())
+				// Present a DualShock 4 v2 (0x09CC), not v1 (0x05C4): SDL/Steam Input cache
+				// per-product controller profiles, so matching the modern model clients
+				// actually own avoids re-detection flapping (Xbox<->PS glyphs, dropped input).
+				DeviceDefinition::new("Moonshine PS4 controller", 0x054C, 0x09CC, 0x8111, id.as_str(), id.as_str())
 			},
 			GamepadKind::PlayStation => DeviceDefinition::new(
 				"Moonshine PS5 controller",
