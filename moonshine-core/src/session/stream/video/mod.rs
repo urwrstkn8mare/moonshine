@@ -1,8 +1,11 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
+use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use serde::{Deserialize, Serialize};
 use tokio::{
+	io::Interest,
 	net::UdpSocket,
 	sync::{broadcast, mpsc, watch, Notify},
 };
@@ -322,17 +325,23 @@ fn spawn_handle_video_packets(
 		let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
 		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
+		// Set up batched sending (GSO when the kernel supports it). On failure we
+		// fall back to one datagram per shard, so this is never fatal.
+		let udp_state = match UdpSocketState::new(UdpSockRef::from(&socket)) {
+			Ok(state) => Some(state),
+			Err(e) => {
+				tracing::warn!("Failed to initialize batched UDP send, falling back to per-packet send: {e}");
+				None
+			},
+		};
+
 		while !stop_session_manager.is_shutdown_triggered() {
 			tokio::select! {
 				batch = packet_rx.recv() => {
 					match batch {
 						Some(batch) => {
 							if let Some(client_address) = client_address {
-								for shard in batch.shards() {
-									if let Err(e) = socket.send_to(shard, client_address).await {
-										tracing::warn!("Failed to send packet to client: {e}");
-									}
-								}
+								send_batch(&socket, udp_state.as_ref(), client_address, &batch).await;
 							}
 						},
 						None => {
@@ -363,4 +372,57 @@ fn spawn_handle_video_packets(
 
 		tracing::debug!("Video packet stream stopped.");
 	});
+}
+
+/// Send every shard in `batch` to `dest`.
+///
+/// When `udp_state` is available the whole contiguous batch is handed to the
+/// kernel using UDP GSO — a single `sendmsg` per chunk emits up to
+/// `max_gso_segments` equal-sized datagrams instead of one syscall per shard.
+/// Chunks are bounded by both the kernel's segment cap and the ~64 KiB
+/// single-call aggregate limit. Without GSO support we fall back to sending one
+/// datagram per shard, matching the previous behaviour.
+async fn send_batch(socket: &UdpSocket, udp_state: Option<&UdpSocketState>, dest: SocketAddr, batch: &ShardBatch) {
+	let segment = batch.shard_size();
+	let data = batch.as_bytes();
+	if segment == 0 || data.is_empty() {
+		return;
+	}
+
+	let Some(state) = udp_state else {
+		for shard in batch.shards() {
+			if let Err(e) = socket.send_to(shard, dest).await {
+				tracing::warn!("Failed to send packet to client: {e}");
+			}
+		}
+		return;
+	};
+
+	// Cap each transmit by the kernel's segment limit and by the ~64 KiB ceiling
+	// on a single GSO buffer (segment_count * segment_size must stay under it).
+	let segments_per_send = state
+		.max_gso_segments()
+		.min((u16::MAX as usize / segment).max(1))
+		.max(1);
+	let chunk_size = segments_per_send * segment;
+
+	for chunk in data.chunks(chunk_size) {
+		let segment_size = if chunk.len() > segment { Some(segment) } else { None };
+		let transmit = Transmit {
+			destination: dest,
+			ecn: None,
+			contents: chunk,
+			segment_size,
+			src_ip: None,
+		};
+
+		// `async_io` awaits writability and retries on `WouldBlock`; quinn-udp's
+		// `send` logs and swallows other (non-fatal, unreliable-UDP) errors.
+		if let Err(e) = socket
+			.async_io(Interest::WRITABLE, || state.send(UdpSockRef::from(socket), &transmit))
+			.await
+		{
+			tracing::warn!("Failed to send video batch to client: {e}");
+		}
+	}
 }

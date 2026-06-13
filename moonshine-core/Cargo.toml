@@ -88,6 +88,8 @@ byteorder = "1.5.0"
 bytes = "1.11.1"
 mio = { version = "1.1.1", features = ["net", "os-ext", "os-poll"] }
 mio-timerfd = "0.2.0"
+# Batched UDP sends (GSO, with plain-send fallback) for video shards.
+quinn-udp = "0.6"
 
 # Session (control stream)
 # Fork adding `replace_peer_when_full` (hgaiser/tokio-enet#2) so a reconnecting client

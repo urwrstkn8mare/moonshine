@@ -29,6 +29,19 @@ impl ShardBatch {
 		}
 	}
 
+	/// The contiguous backing buffer holding every shard back-to-back.
+	///
+	/// Combined with [`ShardBatch::shard_size`], this lets the sender hand the
+	/// whole batch to the kernel in one GSO transmit instead of one send per shard.
+	pub fn as_bytes(&self) -> &[u8] {
+		&self.data
+	}
+
+	/// Size (stride) of each shard in the backing buffer.
+	pub fn shard_size(&self) -> usize {
+		self.shard_size
+	}
+
 	/// Append all shards from `other` into this batch.
 	///
 	/// Both batches must have the same shard_size (or `self` must be empty).
