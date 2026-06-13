@@ -285,6 +285,10 @@ impl ControlStream {
 			address: Some(socket_address),
 			peer_count: 1,
 			channel_limit: 1,
+			// Single-client server: when a client reconnects (e.g. after an abrupt
+			// disconnect whose stale peer hasn't timed out yet), let the new connection
+			// reset the old peer and take over the slot instead of being refused.
+			replace_peer_when_full: true,
 			..Default::default()
 		};
 

@@ -3784,8 +3784,7 @@ dependencies = [
 [[package]]
 name = "tokio-enet"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9afe142c64786c59f520f6ef4bddae98f7110ee4325d592bf2baa6aa4e34952a"
+source = "git+https://github.com/urwrstkn8mare/tokio-enet?rev=f67c13fbf0ed7baaf491d71119cb93a70968ad5c#f67c13fbf0ed7baaf491d71119cb93a70968ad5c"
 dependencies = [
  "socket2 0.5.10",
  "thiserror 2.0.18",
