@@ -1,8 +1,8 @@
 use std::time::Instant;
 
 use inputtino::{
-	BatteryState as InputtinoBatterState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS5Joypad,
-	SwitchJoypad, XboxOneJoypad,
+	BatteryState as InputtinoBatterState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS4Joypad,
+	PS5Joypad, SwitchJoypad, XboxOneJoypad,
 };
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
@@ -33,8 +33,8 @@ enum GamepadCapability {
 	/// Can rumble.
 	_Rumble = 0x02,
 
-	/// Can rumble triggers.
-	_TriggerRumble = 0x04,
+	/// Can rumble triggers (adaptive triggers); DualSense-only, absent on a DualShock 4.
+	TriggerRumble = 0x04,
 
 	/// Reports touchpad events.
 	_Touchpad = 0x08,
@@ -95,7 +95,6 @@ impl GamepadInfo {
 		}
 	}
 
-	#[allow(dead_code)]
 	fn has_capability(&self, capability: &GamepadCapability) -> bool {
 		(self.capabilities & *capability as u16) != 0
 	}
@@ -329,6 +328,12 @@ impl Gamepad {
 				id.as_str(),
 				id.as_str(),
 			),
+			// A DualSense advertises adaptive triggers; a DualShock 4 does not. Use that
+			// to emulate the matching pad — the DS4 gives stronger rumble since games
+			// drive its motors directly instead of routing feedback to DualSense haptics.
+			GamepadKind::PlayStation if !info.has_capability(&GamepadCapability::TriggerRumble) => {
+				DeviceDefinition::new("Moonshine PS4 controller", 0x054C, 0x05C4, 0x8111, id.as_str(), id.as_str())
+			},
 			GamepadKind::PlayStation => DeviceDefinition::new(
 				"Moonshine PS5 controller",
 				0x054C,
@@ -351,6 +356,39 @@ impl Gamepad {
 			GamepadKind::Unknown | GamepadKind::Xbox => Joypad::XboxOne(
 				XboxOneJoypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?,
 			),
+			GamepadKind::PlayStation if !info.has_capability(&GamepadCapability::TriggerRumble) => {
+				let mut gamepad =
+					PS4Joypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?;
+
+				gamepad.set_on_led({
+					let feedback_tx = feedback_tx.clone();
+					let index = info.index;
+					move |r, g, b| {
+						let _ = feedback_tx.blocking_send(FeedbackCommand::SetLed(SetLedCommand {
+							id: index as u16,
+							rgb: (r as u8, g as u8, b as u8),
+						}));
+					}
+				});
+
+				// Enable gyro and accelerometer events (the DS4 has no adaptive triggers).
+				let _ = feedback_tx
+					.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
+						id: info.index as u16,
+						report_rate: 100,
+						motion_type: JoypadMotionType::ACCELERATION as u8,
+					}))
+					.await;
+				let _ = feedback_tx
+					.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
+						id: info.index as u16,
+						report_rate: 100,
+						motion_type: JoypadMotionType::GYROSCOPE as u8,
+					}))
+					.await;
+
+				Joypad::PS4(gamepad)
+			},
 			GamepadKind::PlayStation => {
 				let mut gamepad =
 					PS5Joypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?;
