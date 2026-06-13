@@ -509,62 +509,84 @@ impl Gamepad {
 	}
 
 	pub fn touch(&mut self, touch: &GamepadTouch) {
-		if let Joypad::PS5(gamepad) = &self.gamepad {
-			// Drive the touchpad from Moonlight's explicit touch lifecycle event
-			// rather than inferring up/down from pressure, which clients don't
-			// reliably populate (the DualSense touchpad has no pressure sensor).
-			match touch.event_type {
-				TOUCH_EVENT_DOWN | TOUCH_EVENT_MOVE => {
-					gamepad.place_finger(
-						touch.pointer_id,
-						(touch.x * PS5Joypad::TOUCHPAD_WIDTH as f32) as u16,
-						(touch.y * PS5Joypad::TOUCHPAD_HEIGHT as f32) as u16,
-					);
-					if !self.touch_points.contains(&touch.pointer_id) {
-						self.touch_points.push(touch.pointer_id);
-					}
-				},
-				TOUCH_EVENT_UP | TOUCH_EVENT_CANCEL => {
-					gamepad.release_finger(touch.pointer_id);
-					self.touch_points.retain(|id| *id != touch.pointer_id);
-				},
-				TOUCH_EVENT_CANCEL_ALL => {
-					for pointer_id in self.touch_points.drain(..) {
-						gamepad.release_finger(pointer_id);
-					}
-				},
-				_ => {},
-			}
+		// Drive the touchpad from Moonlight's explicit touch lifecycle event
+		// rather than inferring up/down from pressure, which clients don't
+		// reliably populate (the PlayStation touchpads have no pressure sensor).
+		let (width, height) = match &self.gamepad {
+			Joypad::PS5(_) => (PS5Joypad::TOUCHPAD_WIDTH, PS5Joypad::TOUCHPAD_HEIGHT),
+			Joypad::PS4(_) => (PS4Joypad::TOUCHPAD_WIDTH, PS4Joypad::TOUCHPAD_HEIGHT),
+			_ => return,
+		};
+
+		match touch.event_type {
+			TOUCH_EVENT_DOWN | TOUCH_EVENT_MOVE => {
+				self.place_finger(
+					touch.pointer_id,
+					(touch.x * width as f32) as u16,
+					(touch.y * height as f32) as u16,
+				);
+				if !self.touch_points.contains(&touch.pointer_id) {
+					self.touch_points.push(touch.pointer_id);
+				}
+			},
+			TOUCH_EVENT_UP | TOUCH_EVENT_CANCEL => {
+				self.release_finger(touch.pointer_id);
+				self.touch_points.retain(|id| *id != touch.pointer_id);
+			},
+			TOUCH_EVENT_CANCEL_ALL => {
+				for pointer_id in std::mem::take(&mut self.touch_points) {
+					self.release_finger(pointer_id);
+				}
+			},
+			_ => {},
+		}
+	}
+
+	/// Place a touchpad finger on whichever PlayStation pad is active.
+	fn place_finger(&self, finger_id: u32, x: u16, y: u16) {
+		match &self.gamepad {
+			Joypad::PS5(gamepad) => gamepad.place_finger(finger_id, x, y),
+			Joypad::PS4(gamepad) => gamepad.place_finger(finger_id, x, y),
+			_ => {},
+		}
+	}
+
+	/// Release a touchpad finger on whichever PlayStation pad is active.
+	fn release_finger(&self, finger_id: u32) {
+		match &self.gamepad {
+			Joypad::PS5(gamepad) => gamepad.release_finger(finger_id),
+			Joypad::PS4(gamepad) => gamepad.release_finger(finger_id),
+			_ => {},
 		}
 	}
 
 	pub fn set_motion(&self, motion: &GamepadMotion) {
-		if let Joypad::PS5(gamepad) = &self.gamepad {
-			gamepad.set_motion(
-				motion.motion_type,
-				motion.x.to_radians(),
-				motion.y.to_radians(),
-				motion.z.to_radians(),
-			);
+		let (x, y, z) = (motion.x.to_radians(), motion.y.to_radians(), motion.z.to_radians());
+		match &self.gamepad {
+			Joypad::PS5(gamepad) => gamepad.set_motion(motion.motion_type, x, y, z),
+			Joypad::PS4(gamepad) => gamepad.set_motion(motion.motion_type, x, y, z),
+			_ => {},
 		}
 	}
 
 	pub fn set_battery(&self, gamepad_battery: &GamepadBattery) {
-		if let Joypad::PS5(gamepad) = &self.gamepad {
-			let state = match gamepad_battery.battery_state {
-				BatteryState::Discharging => InputtinoBatterState::BATTERY_DISCHARGING,
-				BatteryState::Charging => InputtinoBatterState::BATTERY_CHARGHING,
-				BatteryState::Full => InputtinoBatterState::BATTERY_FULL,
-				BatteryState::NotPresent => return,
-				BatteryState::NotCharging => return,
-				BatteryState::Unknown => return,
-				_ => {
-					tracing::warn!("Unknown battery state: {:?}", gamepad_battery.battery_state);
-					return;
-				},
-			};
+		let state = match gamepad_battery.battery_state {
+			BatteryState::Discharging => InputtinoBatterState::BATTERY_DISCHARGING,
+			BatteryState::Charging => InputtinoBatterState::BATTERY_CHARGHING,
+			BatteryState::Full => InputtinoBatterState::BATTERY_FULL,
+			BatteryState::NotPresent => return,
+			BatteryState::NotCharging => return,
+			BatteryState::Unknown => return,
+			_ => {
+				tracing::warn!("Unknown battery state: {:?}", gamepad_battery.battery_state);
+				return;
+			},
+		};
 
-			gamepad.set_battery(state, gamepad_battery.battery_percentage);
+		match &self.gamepad {
+			Joypad::PS5(gamepad) => gamepad.set_battery(state, gamepad_battery.battery_percentage),
+			Joypad::PS4(gamepad) => gamepad.set_battery(state, gamepad_battery.battery_percentage),
+			_ => {},
 		}
 	}
 }
