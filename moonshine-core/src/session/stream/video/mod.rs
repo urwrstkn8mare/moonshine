@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
 use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
@@ -9,7 +8,6 @@ use tokio::{
 	io::Interest,
 	net::UdpSocket,
 	sync::{broadcast, mpsc, watch, Notify},
-	time::{sleep_until, Instant},
 };
 
 use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
@@ -285,7 +283,7 @@ impl VideoStream {
 		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
 
 		// Spawn packet handler — gated behind start_notify.
-		spawn_handle_video_packets(packet_rx, socket, context.bitrate, start_notify.clone(), stop.clone());
+		spawn_handle_video_packets(packet_rx, socket, start_notify.clone(), stop.clone());
 
 		// Spawn pipeline thread — gated behind start_notify.
 		VideoPipeline::new(
@@ -311,61 +309,9 @@ impl VideoStream {
 	}
 }
 
-/// Pace shard sends at this multiple of the negotiated video bitrate. A frame's
-/// shards (including FEC parity) momentarily exceed the average bitrate, so the
-/// pacer must run faster than the stream's mean rate or it would starve every
-/// frame; this headroom lets a frame drain in well under its display interval
-/// while still smoothing the GSO micro-bursts that overflow a Wi-Fi hop.
-const PACING_BITRATE_FACTOR: f64 = 2.0;
-
-/// Largest GSO burst handed to the kernel in one `sendmsg`. Smaller than the
-/// kernel's ~64-segment cap so each burst is a short, paceable unit instead of a
-/// single large spike on the wire.
-const MAX_BURST_SEGMENTS: usize = 8;
-
-/// Token-bucket-style pacer that spreads datagram bursts over time so they leave
-/// the NIC at roughly the negotiated bitrate instead of in unpaced GSO spikes.
-struct Pacer {
-	/// Permitted byte rate (bytes/sec). `INFINITY` disables pacing.
-	bytes_per_sec: f64,
-	/// Earliest instant the next burst may be sent.
-	next_send: Option<Instant>,
-}
-
-impl Pacer {
-	fn new(bitrate_bits_per_sec: usize) -> Self {
-		// A zero/unknown bitrate must not pace to a standstill — disable pacing.
-		let bytes_per_sec = if bitrate_bits_per_sec == 0 {
-			f64::INFINITY
-		} else {
-			(bitrate_bits_per_sec as f64 / 8.0) * PACING_BITRATE_FACTOR
-		};
-		Self { bytes_per_sec, next_send: None }
-	}
-
-	/// Wait until `len` bytes may be sent, then charge them against the budget.
-	async fn reserve(&mut self, len: usize) {
-		if !self.bytes_per_sec.is_finite() {
-			return;
-		}
-
-		let now = Instant::now();
-		// Drop a stale schedule (idle gap) so we never burst to "catch up".
-		let send_at = match self.next_send {
-			Some(t) if t > now => {
-				sleep_until(t).await;
-				t
-			},
-			_ => now,
-		};
-		self.next_send = Some(send_at + Duration::from_secs_f64(len as f64 / self.bytes_per_sec));
-	}
-}
-
 fn spawn_handle_video_packets(
 	mut packet_rx: mpsc::Receiver<ShardBatch>,
 	socket: UdpSocket,
-	bitrate: usize,
 	start: Arc<Notify>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
@@ -374,7 +320,6 @@ fn spawn_handle_video_packets(
 
 		let mut buf = [0; 1024];
 		let mut client_address = None;
-		let mut pacer = Pacer::new(bitrate);
 
 		// Trigger session shutdown if we exit unexpectedly.
 		let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
@@ -396,7 +341,7 @@ fn spawn_handle_video_packets(
 					match batch {
 						Some(batch) => {
 							if let Some(client_address) = client_address {
-								send_batch(&socket, udp_state.as_ref(), &mut pacer, client_address, &batch).await;
+								send_batch(&socket, udp_state.as_ref(), client_address, &batch).await;
 							}
 						},
 						None => {
@@ -429,21 +374,15 @@ fn spawn_handle_video_packets(
 	});
 }
 
-/// Send every shard in `batch` to `dest`, paced by `pacer`.
+/// Send every shard in `batch` to `dest`.
 ///
-/// When `udp_state` is available the batch is handed to the kernel using UDP GSO
-/// — a single `sendmsg` emits up to `MAX_BURST_SEGMENTS` equal-sized datagrams
-/// instead of one syscall per shard. Each burst is reserved against the pacer
-/// first, so a frame's shards are spread over time rather than fired as one
-/// micro-burst that overflows a downstream Wi-Fi hop. Without GSO support we fall
-/// back to sending one (also-paced) datagram per shard.
-async fn send_batch(
-	socket: &UdpSocket,
-	udp_state: Option<&UdpSocketState>,
-	pacer: &mut Pacer,
-	dest: SocketAddr,
-	batch: &ShardBatch,
-) {
+/// When `udp_state` is available the whole contiguous batch is handed to the
+/// kernel using UDP GSO — a single `sendmsg` per chunk emits up to
+/// `max_gso_segments` equal-sized datagrams instead of one syscall per shard.
+/// Chunks are bounded by both the kernel's segment cap and the ~64 KiB
+/// single-call aggregate limit. Without GSO support we fall back to sending one
+/// datagram per shard, matching the previous behaviour.
+async fn send_batch(socket: &UdpSocket, udp_state: Option<&UdpSocketState>, dest: SocketAddr, batch: &ShardBatch) {
 	let segment = batch.shard_size();
 	let data = batch.as_bytes();
 	if segment == 0 || data.is_empty() {
@@ -452,7 +391,6 @@ async fn send_batch(
 
 	let Some(state) = udp_state else {
 		for shard in batch.shards() {
-			pacer.reserve(shard.len()).await;
 			if let Err(e) = socket.send_to(shard, dest).await {
 				tracing::warn!("Failed to send packet to client: {e}");
 			}
@@ -460,17 +398,15 @@ async fn send_batch(
 		return;
 	};
 
-	// Bound each transmit by our burst cap, the kernel's segment limit, and the
-	// ~64 KiB ceiling on a single GSO buffer (segment_count * segment_size).
-	let segments_per_send = MAX_BURST_SEGMENTS
-		.min(state.max_gso_segments())
+	// Cap each transmit by the kernel's segment limit and by the ~64 KiB ceiling
+	// on a single GSO buffer (segment_count * segment_size must stay under it).
+	let segments_per_send = state
+		.max_gso_segments()
 		.min((u16::MAX as usize / segment).max(1))
 		.max(1);
 	let chunk_size = segments_per_send * segment;
 
 	for chunk in data.chunks(chunk_size) {
-		pacer.reserve(chunk.len()).await;
-
 		let segment_size = if chunk.len() > segment { Some(segment) } else { None };
 		let transmit = Transmit {
 			destination: dest,
