@@ -318,7 +318,12 @@ impl Gamepad {
 		feedback_tx: mpsc::Sender<FeedbackCommand>,
 		config: &GamepadConfig,
 	) -> Result<Self, ()> {
-		let id = format!("00:11:22:33:{:02x}", info.index);
+		// A stable, unique 6-octet MAC per controller. The DS4 stores its address
+		// little-endian in the pairing report and hid-playstation reverses it for the
+		// evdev `uniq`, so the octets are laid out reversed here: this string surfaces
+		// as `00:24:8d:00:00:<index>`, a real-looking DualShock address rather than the
+		// malformed 5-octet placeholder we emitted before (which became 00:00:33:22:11:00).
+		let id = format!("{:02x}:00:00:8d:24:00", info.index);
 		let definition = match info.kind {
 			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
 				"Moonshine XOne controller",
@@ -332,10 +337,19 @@ impl Gamepad {
 			// to emulate the matching pad — the DS4 gives stronger rumble since games
 			// drive its motors directly instead of routing feedback to DualSense haptics.
 			GamepadKind::PlayStation if !info.has_capability(&GamepadCapability::TriggerRumble) => {
-				// Present a DualShock 4 v2 (0x09CC), not v1 (0x05C4): SDL/Steam Input cache
-				// per-product controller profiles, so matching the modern model clients
-				// actually own avoids re-detection flapping (Xbox<->PS glyphs, dropped input).
-				DeviceDefinition::new("Moonshine PS4 controller", 0x054C, 0x09CC, 0x8111, id.as_str(), id.as_str())
+				// Present the DualShock 4 v2 identity (VID/PID 054C:09CC + the genuine DS4
+				// evdev name and version): SDL reads the Sony VID/PID for PlayStation glyphs,
+				// and this exact bus/vid/pid/version/name matches a real DS4's evdev GUID so
+				// SDL applies the standard DS4 button mapping. This identity is driven through
+				// a uinput gamepad below (not a uhid HID device) so rumble reaches it natively.
+				DeviceDefinition::new(
+					"Sony Interactive Entertainment Wireless Controller",
+					0x054C,
+					0x09CC,
+					0x8111,
+					id.as_str(),
+					id.as_str(),
+				)
 			},
 			GamepadKind::PlayStation => DeviceDefinition::new(
 				"Moonshine PS5 controller",
@@ -360,37 +374,15 @@ impl Gamepad {
 				XboxOneJoypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?,
 			),
 			GamepadKind::PlayStation if !info.has_capability(&GamepadCapability::TriggerRumble) => {
-				let mut gamepad =
-					PS4Joypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?;
-
-				gamepad.set_on_led({
-					let feedback_tx = feedback_tx.clone();
-					let index = info.index;
-					move |r, g, b| {
-						let _ = feedback_tx.blocking_send(FeedbackCommand::SetLed(SetLedCommand {
-							id: index as u16,
-							rgb: (r as u8, g as u8, b as u8),
-						}));
-					}
-				});
-
-				// Enable gyro and accelerometer events (the DS4 has no adaptive triggers).
-				let _ = feedback_tx
-					.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
-						id: info.index as u16,
-						report_rate: 100,
-						motion_type: JoypadMotionType::ACCELERATION as u8,
-					}))
-					.await;
-				let _ = feedback_tx
-					.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
-						id: info.index as u16,
-						report_rate: 100,
-						motion_type: JoypadMotionType::GYROSCOPE as u8,
-					}))
-					.await;
-
-				Joypad::PS4(gamepad)
+				// Drive the DS4 identity through a uinput gamepad (EV_FF) instead of a uhid
+				// hid-playstation device. Games route rumble to a standard force-feedback
+				// gamepad natively, so it works without Steam Input; a uhid DS4 only rumbles
+				// via Steam Input's relay because it lacks the composite-USB identity (USB
+				// interface number / bcdDevice) the generic rumble path keys off. The cost is
+				// no gyro / touchpad / lightbar — those need the hid-playstation HID device.
+				Joypad::XboxOne(
+					XboxOneJoypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?,
+				)
 			},
 			GamepadKind::PlayStation => {
 				let mut gamepad =
