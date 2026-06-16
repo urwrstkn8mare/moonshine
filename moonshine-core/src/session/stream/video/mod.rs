@@ -1,9 +1,14 @@
+use std::io;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
+use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use serde::{Deserialize, Serialize};
 use tokio::{
+	io::Interest,
 	net::UdpSocket,
 	sync::{broadcast, mpsc, watch, Notify},
 };
@@ -36,6 +41,21 @@ pub struct VideoStreamConfig {
 	/// packetize than the frame budget.
 	#[serde(default)]
 	pub log_frame_spikes: bool,
+
+	/// Send-side packet pacing: instead of bursting a frame's UDP packets
+	/// back-to-back (which can overflow the last-hop router/NIC queue and cause
+	/// loss → forced IDR re-sends), spread them out at a target rate of
+	/// `pacing_rate_factor × bitrate`. A frame then drains in roughly
+	/// `frame_interval / pacing_rate_factor`, so higher values add less latency
+	/// but smooth the burst less. `0` disables pacing (packets are bursted);
+	/// values between 0 and 1 are clamped up to 1 (draining slower than the frame
+	/// rate would let frames back up).
+	#[serde(default = "default_pacing_rate_factor")]
+	pub pacing_rate_factor: f32,
+}
+
+fn default_pacing_rate_factor() -> f32 {
+	8.0
 }
 
 impl Default for VideoStreamConfig {
@@ -45,6 +65,7 @@ impl Default for VideoStreamConfig {
 			fec_percentage: 20,
 			encrypt: false,
 			log_frame_spikes: false,
+			pacing_rate_factor: default_pacing_rate_factor(),
 		}
 	}
 }
@@ -278,6 +299,16 @@ impl VideoStream {
 			let _ = socket.set_tos_v4(160);
 		}
 
+		// Wrap the socket with quinn-udp's send state, which drives UDP GSO
+		// (`UDP_SEGMENT`) with automatic capability detection and fallback, plus
+		// `sendmmsg` batching where GSO is unavailable.
+		let udp_state = UdpSocketState::new(UdpSockRef::from(&socket))
+			.map_err(|e| tracing::error!("Failed to initialize UDP socket state: {e}"))?;
+
+		// Build the send-side pacer from the negotiated bitrate and the platform's
+		// max GSO segment count.
+		let pacer = Pacer::new(config.pacing_rate_factor, context.bitrate, udp_state.max_gso_segments());
+
 		// Gate for pipeline + packet handler.
 		let start_notify = Arc::new(Notify::new());
 
@@ -296,6 +327,8 @@ impl VideoStream {
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
+			udp_state,
+			pacer,
 			start_notify.clone(),
 			reset_tx.clone(),
 			resume_pending.clone(),
@@ -326,9 +359,152 @@ impl VideoStream {
 	}
 }
 
+/// Largest payload the kernel will segment from a single GSO `sendmsg`. The
+/// number of equal-sized segments per send is also bounded by this.
+const MAX_GSO_BYTES: usize = 65_535;
+
+/// Send-side packet pacer with UDP GSO batching.
+///
+/// Sends a frame's shards at a target rate (`rate` bytes/sec) rather than
+/// bursting them, so a microburst doesn't overflow the last-hop queue and
+/// trigger loss → forced IDR re-sends. Crucially the spread is *rate*-based, not
+/// spread-across-the-frame: a frame drains in ≈ `frame_bytes / rate`, so small
+/// frames go out almost immediately and only large frames (IDRs) are spread —
+/// keeping added latency low and proportional to frame size.
+///
+/// Each send hands quinn-udp a contiguous run of equal-sized shards with a
+/// `segment_size`, which it transmits via UDP GSO (`UDP_SEGMENT`) — or
+/// `sendmmsg`/per-packet where GSO is unavailable, detected and handled by
+/// quinn-udp itself. Pacing happens between these GSO sends.
+#[derive(Clone, Copy)]
+struct Pacer {
+	/// Target send rate in bytes/sec. Zero disables pacing (sends are flushed
+	/// back-to-back via the largest GSO batches).
+	rate: u64,
+	/// Don't issue a sleep shorter than this — instead let sends coalesce. Sub-
+	/// millisecond sleeps fight the timer's ~1ms granularity and only add
+	/// overhead.
+	min_gap: Duration,
+	/// Platform cap on segments per GSO send, as reported by quinn-udp (1 when
+	/// GSO is unavailable, collapsing each send to a single datagram).
+	max_gso_segments: usize,
+}
+
+impl Pacer {
+	fn new(rate_factor: f32, bitrate: usize, max_gso_segments: usize) -> Self {
+		// Target rate in bytes/sec = (bitrate / 8) * factor. A factor of 0 (or no
+		// bitrate) disables pacing; otherwise it's clamped to at least 1.0 so a
+		// frame never takes longer than its own interval to drain.
+		let rate = if rate_factor > 0.0 && bitrate > 0 {
+			((bitrate as f64 / 8.0) * rate_factor.max(1.0) as f64) as u64
+		} else {
+			0
+		};
+
+		Self {
+			rate,
+			// Aligned with the async timer's ~1ms granularity: shorter sleeps
+			// would just round up to this anyway.
+			min_gap: Duration::from_millis(1),
+			max_gso_segments: max_gso_segments.max(1),
+		}
+	}
+
+	/// Send all shards of a frame to `address`, pacing the sends at `self.rate`.
+	///
+	/// Shards are emitted in contiguous chunks, one quinn-udp send per chunk.
+	/// Pacing uses an absolute schedule anchored at the first send (so transient
+	/// send latency doesn't accumulate drift): each chunk is due once the bytes
+	/// before it would have drained at `self.rate`, and we only sleep when that
+	/// deadline is at least `min_gap` away.
+	async fn send_batch(&self, socket: &UdpSocket, state: &UdpSocketState, batch: &ShardBatch, address: SocketAddr) {
+		let count = batch.shard_count();
+		if count == 0 {
+			return;
+		}
+
+		let seg_size = batch.shard_size();
+		let bytes = batch.as_bytes();
+
+		// Segments per send, bounded by both the platform segment cap and the
+		// 64 KB GSO payload limit.
+		let gso_max = self.max_gso_segments.min(MAX_GSO_BYTES / seg_size.max(1)).max(1);
+
+		// Choose how many segments go in each send.
+		//
+		// Without pacing, fill each send to the GSO limit for the fewest syscalls.
+		// With pacing, size each chunk to roughly one `min_gap` worth of bytes at
+		// the target rate, so consecutive sends land ≈ `min_gap` apart (the finest
+		// the timer resolves) — never exceeding the per-send GSO cap.
+		let segs_per_send = if self.rate == 0 {
+			gso_max
+		} else {
+			let bytes_per_gap = (self.rate as u128 * self.min_gap.as_nanos() / 1_000_000_000) as usize;
+			(bytes_per_gap / seg_size.max(1)).clamp(1, gso_max)
+		};
+
+		// Don't bother sleeping when we're already within this margin of a chunk's
+		// deadline: the timer would round a sub-millisecond sleep up to ~1ms
+		// anyway, and the absolute schedule self-corrects on the next chunk.
+		const SLEEP_FLOOR: Duration = Duration::from_micros(250);
+
+		let start = tokio::time::Instant::now();
+		let mut sent = 0usize;
+
+		while sent < count {
+			// Pace: this chunk is due once the bytes before it have drained at the
+			// target rate. The first chunk (sent == 0) lands immediately.
+			if self.rate > 0 && sent > 0 {
+				let drained_ns = (sent * seg_size) as u128 * 1_000_000_000 / self.rate as u128;
+				let deadline = start + Duration::from_nanos(drained_ns as u64);
+				if deadline.saturating_duration_since(tokio::time::Instant::now()) >= SLEEP_FLOOR {
+					tokio::time::sleep_until(deadline).await;
+				}
+			}
+
+			let chunk_shards = segs_per_send.min(count - sent);
+			let chunk = &bytes[sent * seg_size..(sent + chunk_shards) * seg_size];
+
+			// A single-shard send needs no segmentation; multi-shard sends carry a
+			// `segment_size` so quinn-udp uses GSO (or its own fallback).
+			let segment_size = (chunk_shards > 1).then_some(seg_size);
+			let transmit = Transmit {
+				destination: address,
+				ecn: None,
+				contents: chunk,
+				segment_size,
+				src_ip: None,
+			};
+
+			if let Err(e) = send_transmit(socket, state, &transmit).await {
+				tracing::warn!("Failed to send video packets to client: {e}");
+			}
+
+			sent += chunk_shards;
+		}
+	}
+}
+
+/// Drive one quinn-udp send over the tokio socket. Tries the send immediately
+/// (the common case — the socket is writable) and only awaits writability when
+/// it would block, avoiding a reactor round-trip per send. quinn-udp logs and
+/// swallows non-fatal send errors, returning only `WouldBlock`.
+async fn send_transmit(socket: &UdpSocket, state: &UdpSocketState, transmit: &Transmit<'_>) -> io::Result<()> {
+	loop {
+		match socket.try_io(Interest::WRITABLE, || state.send(UdpSockRef::from(socket), transmit)) {
+			Ok(()) => return Ok(()),
+			Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => socket.writable().await?,
+			Err(e) => return Err(e),
+		}
+	}
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_handle_video_packets(
 	mut packet_rx: mpsc::Receiver<ShardBatch>,
 	socket: UdpSocket,
+	udp_state: UdpSocketState,
+	pacer: Pacer,
 	start: Arc<Notify>,
 	reset_tx: broadcast::Sender<()>,
 	resume_pending: Arc<AtomicBool>,
@@ -350,11 +526,7 @@ fn spawn_handle_video_packets(
 					match batch {
 						Some(batch) => {
 							if let Some(client_address) = client_address {
-								for shard in batch.shards() {
-									if let Err(e) = socket.send_to(shard, client_address).await {
-										tracing::warn!("Failed to send packet to client: {e}");
-									}
-								}
+								pacer.send_batch(&socket, &udp_state, &batch, client_address).await;
 							}
 						},
 						None => {

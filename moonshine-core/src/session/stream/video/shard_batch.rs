@@ -19,14 +19,23 @@ impl ShardBatch {
 		}
 	}
 
-	/// Iterate over all shards as byte slices for sending.
-	pub fn shards(&self) -> impl Iterator<Item = &[u8]> {
-		let size = self.shard_size;
-		if size == 0 {
-			[].chunks_exact(1) // yields an empty iterator
-		} else {
-			self.data.chunks_exact(size)
-		}
+	/// Number of shards in the batch.
+	pub fn shard_count(&self) -> usize {
+		self.data.len().checked_div(self.shard_size).unwrap_or(0)
+	}
+
+	/// Size in bytes of each (equal-sized) shard.
+	pub fn shard_size(&self) -> usize {
+		self.shard_size
+	}
+
+	/// The whole batch as one contiguous buffer of back-to-back shards.
+	///
+	/// All shards share `shard_size`, so this buffer is directly usable as the
+	/// payload for a UDP GSO (`UDP_SEGMENT`) send with segment size `shard_size`,
+	/// or sliced per `shard_size` for per-packet sends.
+	pub fn as_bytes(&self) -> &[u8] {
+		&self.data
 	}
 
 	/// Append all shards from `other` into this batch.

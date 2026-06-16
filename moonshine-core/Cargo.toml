@@ -38,6 +38,7 @@ opus = "0.3.1"
 pkcs8 = "0.11.0"
 pixelforge = { git = "https://github.com/hgaiser/pixelforge", rev = "199bce28a543ad16508a60f3b3f48f4684bfacb8", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
+quinn-udp = "0.6.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"
 rtsp-types = "0.1.3"
