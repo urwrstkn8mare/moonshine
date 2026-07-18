@@ -202,12 +202,10 @@ impl SessionManager {
 	pub async fn trigger_streams_start(&self) {
 		let inner = self.inner.lock().await;
 		if let Some(notify) = inner.video_start_notify.as_ref() {
-			notify.notify_one();
-			notify.notify_one();
+			notify.notify_waiters();
 		}
 		if let Some(notify) = inner.audio_start_notify.as_ref() {
-			notify.notify_one();
-			notify.notify_one();
+			notify.notify_waiters();
 		}
 	}
 
