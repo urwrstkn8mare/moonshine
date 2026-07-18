@@ -192,8 +192,7 @@ pub(crate) struct VideoStreamHandle {
 impl VideoStreamHandle {
 	/// Signal the video pipeline and packet handler to begin processing.
 	pub fn trigger(&self) {
-		self.notify.notify_one();
-		self.notify.notify_one();
+		self.notify.notify_waiters();
 	}
 
 	/// Request an IDR (key) frame from the encoder.
