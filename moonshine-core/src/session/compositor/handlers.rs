@@ -2222,13 +2222,31 @@ impl XwmHandler for MoonshineCompositor {
 		// STEAM_OVERLAY (forwarded as Other) drives overlay z-order: mark it
 		// dirty so update_overlay_z_order runs this frame instead of polling.
 		if let smithay::xwayland::xwm::WmWindowProperty::Other(atom) = property
-			&& self
-				.x11_focus
-				.as_ref()
-				.is_some_and(|xf| xf.steam_overlay_atom() as u32 == atom)
+			&& self.x11_focus.as_ref().is_some_and(|xf| xf.is_overlay_property(atom))
 		{
+			// Steam sets these after map; refresh just this window so focus
+			// doesn't have to re-read every window.
+			if let Some(elem) = self.find_window_by_x11_surface(&window) {
+				let window_id = window.window_id();
+				let (is_overlay, opacity, input_focus_mode) = self.with_x11_focus(|xf| {
+					(
+						xf.get_steam_overlay_value(window_id) != 0,
+						xf.get_window_opacity(window_id),
+						xf.get_input_focus_mode(window_id),
+					)
+				});
+				let interactive = window.geometry().size.w >= self.width as i32 || input_focus_mode != 0;
+				if let Some(meta) = self.window_metadata.get_mut(&elem) {
+					meta.is_overlay = is_overlay;
+					meta.opacity = opacity;
+					meta.input_focus_mode = input_focus_mode;
+					meta.flags.set(WindowFlags::OVERLAY, is_overlay && interactive);
+					meta.flags.set(WindowFlags::NOTIFICATION, is_overlay && !interactive);
+				}
+			}
 			self.overlay_dirty = true;
 			self.screen_dirty = true;
+			self.reevaluate_focus();
 			return;
 		}
 
