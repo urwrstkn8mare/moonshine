@@ -779,24 +779,25 @@ impl MoonshineCompositor {
 				}
 			};
 
-		let mut elements = Vec::new();
-		for window in space.elements() {
+		// Paint order, back to front. `Space::elements()` is back to front.
+		let mut paint_order: Vec<&smithay::desktop::Window> = space
+			.elements()
 			// Decorations and the carried override underlay are painted on top.
-			if decoration_windows.contains(window) || override_underlay_window == Some(window) {
-				continue;
-			}
-			render_window(&mut elements, window);
-		}
+			.filter(|window| !decoration_windows.contains(window) && override_underlay_window != Some(*window))
+			.collect();
 
 		// Same-app decorations ride above the focus window; the underlay sits
 		// between them and the override.
-		for window in decoration_windows
-			.iter()
-			.chain(override_underlay_window.iter().copied())
-		{
-			if !space.elements().any(|e| e == window) {
-				continue;
-			}
+		paint_order.extend(
+			decoration_windows
+				.iter()
+				.chain(override_underlay_window.iter().copied())
+				.filter(|window| space.elements().any(|e| e == *window)),
+		);
+
+		// Render elements are front to back (the topmost comes first).
+		let mut elements = Vec::new();
+		for window in paint_order.into_iter().rev() {
 			render_window(&mut elements, window);
 		}
 
