@@ -1401,21 +1401,21 @@ impl MoonshineCompositor {
 		let pointer_target: Option<Window> = Some(input_focus.clone());
 		self.pointer_focus_window = pointer_target.clone();
 
-		// Raise the input focus window, so a window regaining focus comes back
-		// above a previously raised Steam overlay. Gamescope: `inputFocus->Raise()`
-		// in `DetermineAndApplyFocus`. While a STEAM_OVERLAY is raised,
-		// `update_overlay_z_order` owns the stacking instead.
-		if !self.overlay_raised {
-			let on_top = self.space.elements().last() == Some(&input_focus);
-			if !on_top && self.space.elements().any(|w| w == &input_focus) {
-				self.space.raise_element(&input_focus, false);
-				self.screen_dirty = true;
-				tracing::debug!(
-					target: "focus",
-					x11_id = ?input_focus.x11_surface().map(|x| x.window_id()),
-					"Raised input focus window"
-				);
-			}
+		// Raise the input focus window. Gamescope does this on every focus pass
+		// (`inputFocus->Raise()`): a window regaining focus comes back above a
+		// previously raised window, and while the Steam overlay is up the input
+		// focus *is* the overlay, so it is kept above the game. Smithay's
+		// `map_element` always raises, so a game `configure_notify` would
+		// otherwise put the game back on top.
+		let on_top = self.space.elements().last() == Some(&input_focus);
+		if !on_top && self.space.elements().any(|w| w == &input_focus) {
+			self.space.raise_element(&input_focus, false);
+			self.screen_dirty = true;
+			tracing::debug!(
+				target: "focus",
+				x11_id = ?input_focus.x11_surface().map(|x| x.window_id()),
+				"Raised input focus window"
+			);
 		}
 
 		// Activation state: call set_activated on old and new XDG toplevels.
