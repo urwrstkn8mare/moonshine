@@ -362,8 +362,9 @@ pub(crate) struct Gamepad {
 	/// positions, triggers, touchpad events, and motion data.
 	gamepad: inputtino::Joypad,
 
-	/// Fingers currently on the touchpad, so CancelAll can lift them.
-	touch_points: Vec<u32>,
+	/// Client pointer IDs occupying each touchpad finger slot. Clients pick arbitrary
+	/// pointer IDs, but the DualSense only has two finger slots.
+	touch_slots: [Option<u32>; 2],
 }
 
 impl Gamepad {
@@ -507,7 +508,7 @@ impl Gamepad {
 
 		Ok(Self {
 			gamepad,
-			touch_points: Vec::new(),
+			touch_slots: [None; 2],
 		})
 	}
 
@@ -532,27 +533,45 @@ impl Gamepad {
 			// Follow the touch lifecycle rather than pressure, which clients don't reliably fill in.
 			match touch.event_kind {
 				PointerEventKind::Down | PointerEventKind::Move => {
+					let slot = match self.touch_slot(touch.pointer_id) {
+						Some(slot) => slot,
+						None => {
+							let Some(slot) = self.touch_slots.iter().position(Option::is_none) else {
+								tracing::debug!(pointer_id = touch.pointer_id, "No free gamepad touchpad slot.");
+								return;
+							};
+							self.touch_slots[slot] = Some(touch.pointer_id);
+							slot
+						},
+					};
+
+					// The touchpad reports 0..WIDTH-1 and 0..HEIGHT-1, so x or y of 1.0 must not map to WIDTH or HEIGHT.
 					gamepad.place_finger(
-						touch.pointer_id,
-						(touch.x * PS5Joypad::TOUCHPAD_WIDTH as f32) as u16,
-						(touch.y * PS5Joypad::TOUCHPAD_HEIGHT as f32) as u16,
+						slot as u32,
+						(touch.x * (PS5Joypad::TOUCHPAD_WIDTH - 1) as f32).round() as u16,
+						(touch.y * (PS5Joypad::TOUCHPAD_HEIGHT - 1) as f32).round() as u16,
 					);
-					if !self.touch_points.contains(&touch.pointer_id) {
-						self.touch_points.push(touch.pointer_id);
-					}
 				},
 				PointerEventKind::Up | PointerEventKind::Cancel => {
-					gamepad.release_finger(touch.pointer_id);
-					self.touch_points.retain(|id| *id != touch.pointer_id);
+					if let Some(slot) = self.touch_slot(touch.pointer_id) {
+						gamepad.release_finger(slot as u32);
+						self.touch_slots[slot] = None;
+					}
 				},
 				PointerEventKind::CancelAll => {
-					for pointer_id in self.touch_points.drain(..) {
-						gamepad.release_finger(pointer_id);
+					for (slot, pointer_id) in self.touch_slots.iter_mut().enumerate() {
+						if pointer_id.take().is_some() {
+							gamepad.release_finger(slot as u32);
+						}
 					}
 				},
 				PointerEventKind::Hover | PointerEventKind::ButtonOnly | PointerEventKind::HoverLeave => {},
 			}
 		}
+	}
+
+	fn touch_slot(&self, pointer_id: u32) -> Option<usize> {
+		self.touch_slots.iter().position(|id| *id == Some(pointer_id))
 	}
 
 	pub fn set_motion(&self, motion: &GamepadMotion) {
