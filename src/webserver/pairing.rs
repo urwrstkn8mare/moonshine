@@ -3,7 +3,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use async_shutdown::ShutdownManager;
 use http_body_util::Full;
 use hyper::{
-	Request, Response,
+	Response,
 	body::Bytes,
 	header::{self, HeaderValue},
 };
@@ -54,27 +54,16 @@ fn paired_xml_response(inner: impl std::fmt::Display) -> Response<Full<Bytes>> {
 ///
 /// After completing these steps, we have paired with the client.
 pub async fn handle_pair_request(
-	request: Request<hyper::body::Incoming>,
 	mut params: HashMap<String, String>,
-	local_address: Option<SocketAddr>,
+	ui_address: Option<SocketAddr>,
 	server_certs: &str, // Pass as string (PEM)
 	client_manager: &ClientManager,
-	http_port: u16,
 	shutdown: &ShutdownManager<ShutdownReason>,
 ) -> Response<Full<Bytes>> {
 	if params.contains_key("phrase") {
 		match params.remove("phrase").unwrap().as_str() {
 			"getservercert" => {
-				get_server_cert(
-					request,
-					params,
-					local_address,
-					server_certs,
-					client_manager,
-					http_port,
-					shutdown,
-				)
-				.await
+				get_server_cert(params, ui_address, server_certs, client_manager, shutdown).await
 			},
 			"pairchallenge" => pair_challenge(params),
 			unknown => {
@@ -97,12 +86,10 @@ pub async fn handle_pair_request(
 }
 
 async fn get_server_cert(
-	_request: Request<hyper::body::Incoming>,
 	mut params: HashMap<String, String>,
-	local_address: Option<SocketAddr>,
+	ui_address: Option<SocketAddr>,
 	server_pem_str: &str,
 	client_manager: &ClientManager,
-	http_port: u16,
 	shutdown: &ShutdownManager<ShutdownReason>,
 ) -> Response<Full<Bytes>> {
 	let client_cert = require_param!(params, "clientcert");
@@ -171,11 +158,9 @@ async fn get_server_cert(
 		notify
 	};
 
-	// Emit a notification, allowing the user to automatically open the PIN page.
-	if let Some(local_address) = local_address {
-		let pin_address = SocketAddr::new(local_address.ip(), http_port);
-		let pin_url = format!("http://{pin_address}/pin?uniqueid={unique_id}");
-		tracing::info!("Waiting for pin to be sent at {pin_url}");
+	if let Some(address) = ui_address {
+		let pin_url = format!("http://{address}/#clients");
+		tracing::info!("Pairing request from {unique_id}; enter the PIN at {pin_url}");
 
 		let _ = std::thread::Builder::new()
 			.name("pin-notification".to_string())
@@ -193,13 +178,15 @@ async fn get_server_cert(
 							&& let Err(e) = open::that(&pin_url)
 						{
 							tracing::warn!(
-								"Couldn't open the PIN page automatically ({e}). Open it manually: {pin_url}"
+								"Couldn't open the control panel automatically ({e}). Open it manually: {pin_url}"
 							);
 						}
 					});
 
 				Ok::<(), ()>(())
 			});
+	} else {
+		tracing::info!("Pairing request from {unique_id} is waiting for a PIN.");
 	}
 
 	tokio::select! {

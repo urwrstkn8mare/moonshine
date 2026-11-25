@@ -5,7 +5,7 @@ use std::{
 	path::PathBuf,
 	str::FromStr,
 	sync::{
-		Arc,
+		Arc, OnceLock,
 		atomic::{AtomicBool, Ordering},
 	},
 };
@@ -81,12 +81,17 @@ impl Default for WebserverConfig {
 const SERVERINFO_APP_VERSION: &str = "7.1.431.-1";
 const SERVERINFO_GFE_VERSION: &str = "3.23.0.74";
 
+struct PairingState {
+	enabled: AtomicBool,
+	ui_address: OnceLock<SocketAddr>,
+}
+
 #[derive(Clone)]
 pub struct Webserver {
 	name: String,
 	rtsp_port: u16,
 	webserver_config: WebserverConfig,
-	pairing_enabled: Arc<AtomicBool>,
+	pairing: Arc<PairingState>,
 	application_manager: ApplicationManager,
 	unique_id: String,
 	client_manager: ClientManager,
@@ -118,7 +123,10 @@ impl Webserver {
 		let server = Self {
 			name,
 			rtsp_port,
-			pairing_enabled: Arc::new(AtomicBool::new(webserver_config.enable_pairing)),
+			pairing: Arc::new(PairingState {
+				enabled: AtomicBool::new(webserver_config.enable_pairing),
+				ui_address: OnceLock::new(),
+			}),
 			webserver_config,
 			application_manager,
 			unique_id,
@@ -330,12 +338,17 @@ impl Webserver {
 
 	/// Whether new clients can pair.
 	pub fn pairing_enabled(&self) -> bool {
-		self.pairing_enabled.load(Ordering::Relaxed)
+		self.pairing.enabled.load(Ordering::Relaxed)
 	}
 
 	/// Allow or refuse new clients to pair. Paired clients are not affected.
 	pub fn set_pairing_enabled(&self, enabled: bool) {
-		self.pairing_enabled.store(enabled, Ordering::Relaxed);
+		self.pairing.enabled.store(enabled, Ordering::Relaxed);
+	}
+
+	#[cfg(feature = "ui")]
+	pub(crate) fn set_pairing_ui_address(&self, address: SocketAddr) {
+		let _ = self.pairing.ui_address.set(address);
 	}
 
 	async fn serve(
@@ -378,12 +391,10 @@ impl Webserver {
 						return Ok(bad_request("Pairing is disabled.".to_string()));
 					}
 					handle_pair_request(
-						request,
 						params,
-						local_address,
+						self.pairing.ui_address.get().copied(),
 						&self.server_certs,
 						&self.client_manager,
-						self.webserver_config.port,
 						&self.shutdown,
 					)
 					.await
@@ -424,21 +435,13 @@ impl Webserver {
 						return Ok(bad_request("Pairing is disabled.".to_string()));
 					}
 					handle_pair_request(
-						request,
 						params,
-						local_address,
+						self.pairing.ui_address.get().copied(),
 						&self.server_certs,
 						&self.client_manager,
-						self.webserver_config.port,
 						&self.shutdown,
 					)
 					.await
-				},
-				(&Method::GET, "/pin") => {
-					if !self.pairing_enabled() {
-						return Ok(bad_request("Pairing is disabled.".to_string()));
-					}
-					self.pin(params)
 				},
 				(&Method::POST, "/submit-pin") => {
 					if !self.pairing_enabled() {
@@ -632,30 +635,6 @@ impl Webserver {
 		response
 			.headers_mut()
 			.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
-		response
-	}
-
-	fn pin(&self, params: HashMap<String, String>) -> Response<Full<Bytes>> {
-		let unique_id = params
-			.get("uniqueid")
-			.cloned()
-			.map(|id| {
-				id.chars()
-					.filter(|c| c.is_ascii_hexdigit())
-					.take(16)
-					.collect::<String>()
-			})
-			.filter(|id| !id.is_empty())
-			.unwrap_or_else(|| "0123456789ABCDEF".to_string());
-		let content = include_bytes!("../../assets/pin.html");
-		let html = String::from_utf8_lossy(content);
-		let html = html.replace("{{UNIQUE_ID}}", &unique_id);
-		let mut response = Response::new(Full::new(Bytes::from(html)));
-		response.headers_mut().insert(
-			header::CONTENT_TYPE,
-			HeaderValue::from_static("text/html; charset=UTF-8"),
-		);
-
 		response
 	}
 

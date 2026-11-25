@@ -294,6 +294,6 @@ curl -X POST "http://localhost:47989/submit-pin" -d "pin=<PIN>"
 
 #### Details
 
-The PIN goes to the pairing request that waits for one. If no request waits, Moonshine answers 404. If several requests wait, it answers 409: then add the `uniqueid=<id>` of one of them (the pairing page and the log show it).
+The PIN goes to the pairing request that waits for one. If no request waits, Moonshine answers 404. If several requests wait, it answers 409: then add `-d "uniqueid=<id>"` using the client ID from the host log.
 
-This does the same as the Clients page of the control panel or the page at http://localhost:47989/pin . It is useful on a host without a browser, for example over SSH.
+Use this on a host without a browser, over SSH, or when the control panel is disabled.
