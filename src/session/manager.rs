@@ -13,6 +13,7 @@ use crate::session::SessionKeys;
 use crate::session::SessionKeysSender;
 use crate::session::SessionState;
 use crate::session::compositor::CompositorConfig;
+use crate::session::stream::AvPingToken;
 use crate::session::stream::StartSignal;
 use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
@@ -366,6 +367,10 @@ impl SessionManager {
 	pub async fn get_session_context(&self) -> Result<Option<SessionContext>, ()> {
 		let guard = self.inner.lock().await;
 		Ok(guard.session.as_ref().map(|s| s.context().clone()))
+	}
+
+	pub(crate) async fn av_ping_token(&self) -> Option<AvPingToken> {
+		self.inner.lock().await.session.as_ref().map(SessionState::av_ping_token)
 	}
 
 	/// Initialize a new session with the provided context.

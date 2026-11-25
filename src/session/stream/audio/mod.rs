@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::session::SessionKeysReceiver;
 use crate::session::manager::SessionShutdownReason;
-use crate::session::stream::{StartSignal, StartWaiter};
+use crate::session::stream::{AvPingToken, StartSignal, StartWaiter};
 
 use self::encoder::AudioEncoder;
 use self::pulse_server::PulseServer;
@@ -334,7 +334,12 @@ impl AudioStream {
 		})
 	}
 
-	pub fn start(self, context: AudioStreamContext, keys_rx: SessionKeysReceiver) -> Result<StartSignal, ()> {
+	pub fn start(
+		self,
+		context: AudioStreamContext,
+		av_ping_token: AvPingToken,
+		keys_rx: SessionKeysReceiver,
+	) -> Result<StartSignal, ()> {
 		log::stream_start(&context);
 
 		// Apply QoS to UDP socket.
@@ -347,7 +352,7 @@ impl AudioStream {
 
 		// Create packet channel and spawn handler — gated behind start.
 		let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(10);
-		spawn_handle_audio_packets(packet_rx, self.udp_socket, start.waiter(), self.stop.clone());
+		spawn_handle_audio_packets(packet_rx, self.udp_socket, av_ping_token, start.waiter(), self.stop.clone());
 
 		// Create frame channels for PulseServer and encoder communication.
 		let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
@@ -386,6 +391,7 @@ impl AudioStream {
 fn spawn_handle_audio_packets(
 	mut packet_rx: mpsc::Receiver<Vec<u8>>,
 	socket: UdpSocket,
+	av_ping_token: AvPingToken,
 	mut start: StartWaiter,
 	stop: ShutdownManager<SessionShutdownReason>,
 ) {
@@ -428,7 +434,7 @@ fn spawn_handle_audio_packets(
 						Err(_) => break,
 					};
 
-					if &buf[..len] == b"PING" {
+					if av_ping_token.matches(&buf[..len]) {
 						tracing::trace!("Received audio stream PING message from {address}.");
 						client_address = Some(address);
 					} else {
@@ -452,7 +458,7 @@ mod tests {
 		let (packet_tx, packet_rx) = mpsc::channel(1);
 		let start = StartSignal::new();
 		let stop = ShutdownManager::new();
-		spawn_handle_audio_packets(packet_rx, socket, start.waiter(), stop.clone());
+		spawn_handle_audio_packets(packet_rx, socket, AvPingToken::new().unwrap(), start.waiter(), stop.clone());
 
 		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
 		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())

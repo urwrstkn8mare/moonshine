@@ -6,6 +6,7 @@ use tokio::sync::watch;
 
 use crate::gpu::GpuContext;
 use crate::session::compositor::CompositorConfig;
+use crate::session::stream::AvPingToken;
 use crate::session::stream::StartSignal;
 use crate::session::stream::audio::AudioChannels;
 use crate::session::stream::audio::AudioStream;
@@ -127,11 +128,20 @@ impl SessionState {
 			Self::Active(active) => active.context(),
 		}
 	}
+
+	fn av_ping_token(&self) -> AvPingToken {
+		match self {
+			Self::Initialized(session) => session.av_ping_token,
+			Self::Launched(session) => session.av_ping_token,
+			Self::Active(session) => session.av_ping_token,
+		}
+	}
 }
 
 /// Initialized session state — components created, compositor and app not yet started.
 pub(crate) struct InitializedSession {
 	context: SessionContext,
+	av_ping_token: AvPingToken,
 	/// Names the application's systemd unit and the PulseAudio socket directory
 	/// (see `SessionManager::new`).
 	session_name: String,
@@ -183,6 +193,7 @@ impl InitializedSession {
 
 		Ok(Self {
 			context,
+			av_ping_token: AvPingToken::new()?,
 			session_name,
 			compositor,
 			audio_stream: audio,
@@ -201,6 +212,7 @@ impl InitializedSession {
 	pub(crate) async fn launch(self) -> Result<LaunchedSession, ()> {
 		let Self {
 			context,
+			av_ping_token,
 			session_name,
 			compositor,
 			audio_stream: audio,
@@ -238,6 +250,7 @@ impl InitializedSession {
 
 		Ok(LaunchedSession {
 			context,
+			av_ping_token,
 			application,
 			video_stream,
 			launched_compositor,
@@ -251,6 +264,7 @@ impl InitializedSession {
 /// Launched session state — compositor and app running, waiting for RTSP negotiation.
 pub(crate) struct LaunchedSession {
 	context: SessionContext,
+	av_ping_token: AvPingToken,
 	application: Application,
 	video_stream: VideoStream,
 	launched_compositor: LaunchedCompositor,
@@ -275,6 +289,7 @@ impl LaunchedSession {
 	) -> Result<(ActiveSession, StartSignal, StartSignal), ()> {
 		let Self {
 			context,
+			av_ping_token,
 			launched_compositor,
 			application,
 			audio,
@@ -294,12 +309,12 @@ impl LaunchedSession {
 
 		// Start video stream — gated, returns VideoStreamHandle.
 		let video_handle = video_stream
-			.start(video_config, video_ctx, keys_rx.clone(), stop.clone())
+			.start(video_config, video_ctx, av_ping_token, keys_rx.clone(), stop.clone())
 			.map_err(|()| tracing::error!("Failed to start video stream"))?;
 
 		// Start audio stream — gated, returns its StartSignal.
 		let audio_trigger = audio
-			.start(audio_ctx, keys_rx)
+			.start(audio_ctx, av_ping_token, keys_rx)
 			.map_err(|()| tracing::error!("Failed to start audio stream"))?;
 
 		// Clone the start flags for external triggering (e.g. bench binary).
@@ -329,6 +344,7 @@ impl LaunchedSession {
 		Ok((
 			ActiveSession {
 				context,
+				av_ping_token,
 				_application: application,
 				video_handle: video_handle_for_resume,
 				sleep_inhibitor,
@@ -342,6 +358,7 @@ impl LaunchedSession {
 /// Active session state — streams are active.
 pub(crate) struct ActiveSession {
 	context: SessionContext,
+	av_ping_token: AvPingToken,
 	_application: Application,
 	video_handle: VideoStreamHandle,
 	/// Held while the session is active to keep the host awake; dropped on teardown.
