@@ -147,6 +147,15 @@ const SETTINGS: &[SettingSpec] = &[
 		Effect::NextStream,
 	),
 	setting(
+		"tray",
+		&["ui", "tray"],
+		GENERAL,
+		"Tray icon",
+		"Shows whether a device streams. Click it to open this page.",
+		Kind::Bool,
+		Effect::Restart,
+	),
+	setting(
 		"hdr",
 		&["compositor", "hdr"],
 		VIDEO,
@@ -397,6 +406,15 @@ pub async fn spawn(context: UiContext) -> Result<Option<UiServer>, ()> {
 			.map(|name| name.trim().to_string()),
 	);
 
+	#[cfg(feature = "tray")]
+	let tray = listen.first().filter(|_| ui.tray).map(|&address| {
+		(
+			local_url(address),
+			context.session_manager.clone(),
+			context.shutdown.clone(),
+		)
+	});
+
 	let logs = context.logs.clone();
 	let backend = Arc::new(UiBackend::new(context));
 	let server = moonshine_ui::serve(
@@ -411,7 +429,24 @@ pub async fn spawn(context: UiContext) -> Result<Option<UiServer>, ()> {
 	.await
 	.map_err(|e| tracing::error!("{e}"))?;
 
+	#[cfg(feature = "tray")]
+	if let Some((url, session_manager, shutdown)) = tray {
+		crate::tray::spawn(url, session_manager, shutdown);
+	}
+
 	Ok(Some(server))
+}
+
+/// The URL a browser on this computer opens the control panel at, from an address it listens on.
+#[cfg(feature = "tray")]
+fn local_url(mut address: SocketAddr) -> String {
+	if address.ip().is_unspecified() {
+		address.set_ip(match address.ip() {
+			IpAddr::V4(_) => Ipv4Addr::LOCALHOST.into(),
+			IpAddr::V6(_) => Ipv6Addr::LOCALHOST.into(),
+		});
+	}
+	format!("http://{address}/")
 }
 
 pub struct UiBackend {
