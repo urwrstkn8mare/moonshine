@@ -6,7 +6,7 @@
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,6 +78,14 @@ const MAX_BODY: usize = 64 * 1024;
 /// The running control panel. Dropping it stops the control panel.
 pub struct UiServer {
 	tasks: Vec<JoinHandle<()>>,
+	browser_address: Option<SocketAddr>,
+}
+
+impl UiServer {
+	/// A local browser address, if one of the listeners accepts connections from the host.
+	pub fn browser_address(&self) -> Option<SocketAddr> {
+		self.browser_address
+	}
 }
 
 impl Drop for UiServer {
@@ -166,14 +174,26 @@ pub async fn serve<B: Backend>(backend: Arc<B>, options: Options, logs: LogBuffe
 		logs,
 	});
 
+	let mut browser_address = None;
 	for listener in listeners {
-		if let Ok(address) = listener.local_addr() {
+		if let Ok(mut address) = listener.local_addr() {
 			tracing::info!("Control panel listening on http://{address}");
+			if address.ip().is_unspecified() {
+				address.set_ip(match address.ip() {
+					IpAddr::V4(_) => Ipv4Addr::LOCALHOST.into(),
+					IpAddr::V6(_) => Ipv6Addr::LOCALHOST.into(),
+				});
+			}
+			if browser_address.is_none()
+				&& state.options.allowed_networks.iter().any(|range| range.contains(address.ip()))
+			{
+				browser_address = Some(address);
+			}
 		}
 		tasks.push(tokio::spawn(accept(listener, state.clone())));
 	}
 
-	Ok(UiServer { tasks })
+	Ok(UiServer { tasks, browser_address })
 }
 
 fn snapshot_json(snapshot: &Snapshot) -> String {

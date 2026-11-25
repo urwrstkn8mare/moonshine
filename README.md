@@ -160,8 +160,8 @@ To open it through a reverse proxy, see [TIPS.md](TIPS.md#open-the-control-panel
 
 When you connect with Moonlight for the first time, it shows a PIN.
 Type it on the Clients page of the [control panel](#control-panel).
-You can also click the notification on the host, or open http://localhost:47989/pin .
-To pair without a browser, see [TIPS.md](TIPS.md#pair-a-client-from-the-command-line).
+The desktop notification on the host opens that page directly.
+If the control panel is disabled or you don't have a browser, see [TIPS.md](TIPS.md#pair-a-client-from-the-command-line).
 
 ### Adding applications
 
@@ -274,6 +274,12 @@ Run:
 
 ```sh
 cargo run --release -- /path/to/config.toml
+```
+
+For detailed host-side pairing and GameStream HTTP logs, run:
+
+```sh
+MOONSHINE_LOG=moonshine=info,moonshine::webserver=debug cargo run --release -- /path/to/config.toml
 ```
 
 ## Contributing
