@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `/submit-pin` no longer needs a `uniqueid`: without one, the PIN goes to the pairing request that waits for it, so pairing from the command line is `curl -X POST http://localhost:47989/submit-pin -d pin=<PIN>`. It answers 404 if no request waits and 409 if several do.
+- Open the control panel's Clients page from pairing notifications and remove the old `/pin` page, which truncated longer client IDs such as Glimmer's. Command-line pairing still works with the control panel off.
+- Show the control panel URL and Moonshine's info logs in the terminal by default.
 
 ### Fixed
 

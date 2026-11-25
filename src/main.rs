@@ -225,10 +225,9 @@ fn init_tracing(#[cfg(feature = "ui")] logs: &moonshine_ui::LogBuffer) {
 
 	let terminal = tracing_subscriber::fmt::layer()
 		.with_ansi(std::io::stdout().is_terminal())
-		.with_filter(EnvFilter::try_from_env("MOONSHINE_LOG").unwrap_or_else(|_| EnvFilter::new("error")));
+		.with_filter(EnvFilter::try_from_env("MOONSHINE_LOG").unwrap_or_else(|_| EnvFilter::new("error,moonshine=info")));
 	let registry = tracing_subscriber::registry().with(terminal);
 
-	// The control panel shows more than the terminal does by default.
 	#[cfg(feature = "ui")]
 	let registry = registry.with(logs.layer().with_filter(EnvFilter::new("info,moonshine=debug")));
 

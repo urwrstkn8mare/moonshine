@@ -398,6 +398,7 @@ pub async fn spawn(context: UiContext) -> Result<Option<UiServer>, ()> {
 	);
 
 	let logs = context.logs.clone();
+	let webserver = context.webserver.clone();
 	let backend = Arc::new(UiBackend::new(context));
 	let server = moonshine_ui::serve(
 		backend,
@@ -410,6 +411,11 @@ pub async fn spawn(context: UiContext) -> Result<Option<UiServer>, ()> {
 	)
 	.await
 	.map_err(|e| tracing::error!("{e}"))?;
+
+	if let Some(address) = server.browser_address() {
+		webserver.set_pairing_ui_address(address);
+		tracing::info!("Open the control panel at http://{address}/");
+	}
 
 	Ok(Some(server))
 }
