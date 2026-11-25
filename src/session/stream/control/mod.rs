@@ -9,6 +9,7 @@ use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
 use self::input::InputHandler;
 use self::input::gamepad::GamepadConfig;
 use crate::crypto::{decrypt, encrypt};
+use crate::session::MediaControls;
 use crate::session::SessionContext;
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::{
@@ -16,8 +17,6 @@ use crate::session::compositor::{
 	input::CompositorInput,
 };
 use crate::session::manager::SessionShutdownReason;
-use crate::session::stream::StartSignal;
-use crate::session::stream::video::VideoStreamHandle;
 
 mod feedback;
 pub(crate) mod input;
@@ -269,20 +268,12 @@ fn encode_control(key: &[u8], sequence_number: u32, payload: &[u8]) -> Result<Ve
 #[derive(Clone)]
 pub(crate) struct ControlStreamContext {
 	pub keys_rx: SessionKeysReceiver,
-	pub hdr: bool,
 }
 
 impl ControlStreamContext {
-	/// Create a `ControlStreamContext` from a session context and the *effective*
-	/// HDR flag reported by the compositor after launch.
-	///
-	/// `hdr_effective` may differ from `ctx.hdr` when the client requested HDR but
-	/// the GPU does not support an HDR-capable DMA-BUF format (compositor falls back
-	/// to SDR and reports `hdr = false` in `CompositorReady`).
-	pub fn new(ctx: &SessionContext, hdr_effective: bool) -> Self {
+	pub fn new(ctx: &SessionContext) -> Self {
 		Self {
 			keys_rx: ctx.keys.clone_rx().expect("session keys not initialized"),
-			hdr: hdr_effective,
 		}
 	}
 }
@@ -331,8 +322,7 @@ impl ControlStream {
 		self,
 		stream_timeout: u64,
 		context: ControlStreamContext,
-		video_handle: VideoStreamHandle,
-		audio_trigger: StartSignal,
+		media: watch::Receiver<MediaControls>,
 		hdr_metadata_rx: watch::Receiver<HdrModeState>,
 	) {
 		let Self {
@@ -345,8 +335,7 @@ impl ControlStream {
 			run_control_loop(
 				stream_timeout,
 				host,
-				video_handle,
-				audio_trigger,
+				media,
 				context,
 				input_handler,
 				stop_session_manager,
@@ -459,8 +448,7 @@ fn send_hdr_state(
 async fn run_control_loop(
 	stream_timeout: u64,
 	mut host: Host,
-	video_handle: VideoStreamHandle,
-	audio_trigger: StartSignal,
+	mut media: watch::Receiver<MediaControls>,
 	context: ControlStreamContext,
 	input_handler: InputHandler,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
@@ -475,11 +463,16 @@ async fn run_control_loop(
 	// Sequence number of feedback messages.
 	let mut sequence_number = 0u32;
 	let mut send_hdr_mode = false;
-	let mut audio_triggered = false;
+	let mut hdr_started = false;
 	// Track which peer slot the client is connected to.
 	let mut connected_peer: Option<tokio_enet::PeerId> = None;
 
 	while !stop_session_manager.is_shutdown_triggered() {
+		if media.has_changed().unwrap_or(false) {
+			let _ = media.borrow_and_update();
+			hdr_started = false;
+			stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
+		}
 		// Check if the timeout has passed.
 		if std::time::Instant::now() > stop_deadline {
 			tracing::info!(
@@ -561,18 +554,16 @@ async fn run_control_loop(
 						unreachable!("Encrypted control messages should be decrypted already.")
 					},
 					ControlMessage::RequestIdrFrame => {
-						video_handle.request_idr_frame();
+						media.borrow().video.request_idr_frame();
 					},
 					ControlMessage::InvalidateReferenceFrames { first, last } => {
-						video_handle.invalidate_reference_frames(first, last);
+						media.borrow().video.invalidate_reference_frames(first, last);
 					},
 					ControlMessage::StartB => {
-						video_handle.trigger();
-						if !audio_triggered {
-							audio_trigger.trigger();
-							audio_triggered = true;
-						}
-						send_hdr_mode = context.hdr;
+						let media = media.borrow_and_update();
+						media.trigger();
+						hdr_started = media.hdr;
+						send_hdr_mode = hdr_started;
 					},
 					ControlMessage::Ping => {
 						stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
@@ -604,7 +595,7 @@ async fn run_control_loop(
 		}
 
 		// Check for HDR metadata updates from the video pipeline.
-		if context.hdr
+		if hdr_started
 			&& hdr_metadata_rx.has_changed().unwrap_or(false)
 			&& let Some(peer_id) = connected_peer
 		{

@@ -753,13 +753,13 @@ async fn run_benchmark(
 	};
 
 	tracing::info!("Setting stream contexts...");
-	if let Err(err) = session_manager.set_stream_context(video_ctx, audio_ctx).await {
+	if let Err(err) = session_manager.set_stream_context(video_ctx, audio_ctx, None).await {
 		let _ = session_manager.stop_session().await;
 		return Err(boxed_error(format!("Failed to set stream context: {err:?}")));
 	}
 
 	tracing::info!("Starting session streams...");
-	if let Err(err) = session_manager.start_session().await {
+	if let Err(err) = session_manager.start_session(None).await {
 		let _ = session_manager.stop_session().await;
 		return Err(boxed_error(format!("Failed to start session: {err:?}")));
 	}

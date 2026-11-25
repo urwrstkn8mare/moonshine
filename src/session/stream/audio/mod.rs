@@ -2,6 +2,7 @@ use std::ffi::CStr;
 use std::fmt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
 use pulseaudio::protocol as pulse;
@@ -15,7 +16,7 @@ use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::{AvPingToken, StartSignal, StartWaiter};
 
 use self::encoder::AudioEncoder;
-use self::pulse_server::PulseServer;
+use self::pulse_server::{CaptureOutput, PulseServer};
 
 mod buffer;
 mod encoder;
@@ -285,9 +286,10 @@ pub struct AudioStreamContext {
 }
 
 pub(crate) struct AudioStream {
-	pulse_socket: UnixListener,
+	pulse_socket: Option<UnixListener>,
+	pulse_output_tx: Option<crossbeam_channel::Sender<CaptureOutput>>,
 	pub pulse_socket_path: PathBuf,
-	udp_socket: tokio::net::UdpSocket,
+	udp_socket: Arc<UdpSocket>,
 	stop: ShutdownManager<SessionShutdownReason>,
 }
 
@@ -327,50 +329,35 @@ impl AudioStream {
 		tracing::debug!("Listening for audio messages on {}", pulse_socket_path.display());
 
 		Ok(AudioStream {
-			pulse_socket,
+			pulse_socket: Some(pulse_socket),
+			pulse_output_tx: None,
 			pulse_socket_path,
-			udp_socket,
+			udp_socket: Arc::new(udp_socket),
 			stop,
 		})
 	}
 
+	/// Start one negotiated media generation. The session owner must wait for
+	/// the previous generation to stop before reusing the UDP socket.
 	pub fn start(
-		self,
+		&mut self,
 		context: AudioStreamContext,
 		av_ping_token: AvPingToken,
 		keys_rx: SessionKeysReceiver,
+		media_stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<StartSignal, ()> {
 		log::stream_start(&context);
 
-		// Apply QoS to UDP socket.
-		if context.qos {
-			let _ = self.udp_socket.set_tos_v4(224);
-		}
+		// Reapply QoS on the shared socket, including clearing the previous generation's marking.
+		let _ = self.udp_socket.set_tos_v4(if context.qos { 224 } else { 0 });
 
 		// Gate for encoder and packet handler.
 		let start = StartSignal::new();
 
-		// Create packet channel and spawn handler — gated behind start.
 		let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(10);
-		spawn_handle_audio_packets(packet_rx, self.udp_socket, av_ping_token, start.waiter(), self.stop.clone());
-
-		// Create frame channels for PulseServer and encoder communication.
 		let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
 		let (frame_recycle_tx, frame_recycle_rx) = crossbeam_channel::bounded(3);
 
-		// Spawn PulseServer immediately (no gating — it just mixes audio, no network impact).
-		PulseServer::spawn(
-			self.pulse_socket,
-			self.pulse_socket_path.clone(),
-			context.audio_config.channels,
-			context.packet_duration_ms,
-			frame_tx,
-			frame_recycle_rx,
-			self.stop.clone(),
-		)
-		.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?;
-
-		// Spawn audio encoder — gated behind start.
 		AudioEncoder::spawn(
 			SINK_SAMPLE_RATE,
 			context.packet_duration_ms,
@@ -380,8 +367,41 @@ impl AudioStream {
 			keys_rx,
 			context.encrypt_audio,
 			packet_tx,
-			self.stop.clone(),
+			media_stop.clone(),
 			start.waiter(),
+		)?;
+
+		let output = CaptureOutput {
+			channels: context.audio_config.channels,
+			packet_duration_ms: context.packet_duration_ms,
+			frame_tx,
+			frame_recycle_rx,
+			stop: media_stop.clone(),
+		};
+		if let Some(output_tx) = &self.pulse_output_tx {
+			output_tx
+				.send(output)
+				.map_err(|_| tracing::error!("PulseServer closed before audio media setup"))?;
+		} else {
+			// Start capture once, on the first negotiation, so initial Pulse
+			// clients see the negotiated sink layout. Later generations switch
+			// output on the same server and keep the connected playback streams.
+			let listener = self
+				.pulse_socket
+				.take()
+				.ok_or_else(|| tracing::error!("PulseServer listener is unavailable"))?;
+			self.pulse_output_tx = Some(
+				PulseServer::spawn(listener, output, self.stop.clone())
+					.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?,
+			);
+		}
+
+		spawn_handle_audio_packets(
+			packet_rx,
+			Arc::clone(&self.udp_socket),
+			av_ping_token,
+			start.waiter(),
+			media_stop,
 		)?;
 
 		Ok(start)
@@ -389,80 +409,110 @@ impl AudioStream {
 }
 
 fn spawn_handle_audio_packets(
+	packet_rx: mpsc::Receiver<Vec<u8>>,
+	socket: Arc<UdpSocket>,
+	av_ping_token: AvPingToken,
+	start: StartWaiter,
+	stop: ShutdownManager<SessionShutdownReason>,
+) -> Result<(), ()> {
+	let delay_stop = stop
+		.delay_shutdown_token()
+		.map_err(|e| tracing::debug!("Cannot start audio packet handler: {e}"))?;
+	// Drop the whole worker (including its socket and packet receiver) before
+	// marking the generation stopped, even if the task never reaches the gate.
+	let worker = (
+		handle_audio_packets(packet_rx, socket, av_ping_token, start, stop),
+		delay_stop,
+	);
+	tokio::spawn(async move {
+		let (handle, _delay_stop) = worker;
+		handle.await;
+	});
+	Ok(())
+}
+
+async fn handle_audio_packets(
 	mut packet_rx: mpsc::Receiver<Vec<u8>>,
-	socket: UdpSocket,
+	socket: Arc<UdpSocket>,
 	av_ping_token: AvPingToken,
 	mut start: StartWaiter,
 	stop: ShutdownManager<SessionShutdownReason>,
 ) {
-	tokio::spawn(async move {
-		if !start.wait(&stop).await {
-			return;
+	if !start.wait(&stop).await {
+		return;
+	}
+
+	let mut buf = [0; 1024];
+	let mut client_address = None;
+	let _stop_token = stop.trigger_shutdown_token(SessionShutdownReason::AudioPacketHandlerStopped);
+
+	while !stop.is_shutdown_triggered() {
+		tokio::select! {
+			packet = stop.wrap_cancel(packet_rx.recv()) => {
+				match packet {
+					Ok(Some(packet)) => {
+						if let Some(client_address) = client_address
+							&& let Ok(Err(e)) = stop.wrap_cancel(socket.send_to(packet.as_slice(), client_address)).await
+						{
+							tracing::warn!("Failed to send packet to client: {e}");
+						}
+					},
+					_ => {
+						tracing::debug!("Audio packet channel closed.");
+						break;
+					},
+				}
+			},
+
+			message = stop.wrap_cancel(socket.recv_from(&mut buf)) => {
+				let (len, address) = match message {
+					Ok(Ok((len, address))) => (len, address),
+					Ok(Err(e)) => {
+						tracing::warn!("Failed to receive message: {e}");
+						break;
+					},
+					Err(_) => break,
+				};
+
+				if av_ping_token.matches(&buf[..len]) {
+					tracing::trace!("Received audio stream PING message from {address}.");
+					client_address = Some(address);
+				} else {
+					tracing::warn!("Received unknown message on audio stream of length {len}.");
+				}
+			},
 		}
+	}
 
-		let mut buf = [0; 1024];
-		let mut client_address = None;
-
-		// Trigger session shutdown when the audio packet stream stops.
-		let _stop_token = stop.trigger_shutdown_token(SessionShutdownReason::AudioPacketHandlerStopped);
-		let _delay_stop = stop.delay_shutdown_token();
-
-		while !stop.is_shutdown_triggered() {
-			tokio::select! {
-				packet = stop.wrap_cancel(packet_rx.recv()) => {
-					match packet {
-						Ok(Some(packet)) => {
-							if let Some(client_address) = client_address
-								&& let Err(e) = socket.send_to(packet.as_slice(), client_address).await {
-									tracing::warn!("Failed to send packet to client: {e}");
-								}
-						},
-						_ => {
-							tracing::debug!("Audio packet channel closed.");
-							break;
-						},
-					}
-				},
-
-				message = stop.wrap_cancel(socket.recv_from(&mut buf)) => {
-					let (len, address) = match message {
-						Ok(Ok((len, address))) => (len, address),
-						Ok(Err(e)) => {
-							tracing::warn!("Failed to receive message: {e}");
-							break;
-						},
-						Err(_) => break,
-					};
-
-					if av_ping_token.matches(&buf[..len]) {
-						tracing::trace!("Received audio stream PING message from {address}.");
-						client_address = Some(address);
-					} else {
-						tracing::warn!("Received unknown message on audio stream of length {len}.");
-					}
-				},
-			}
-		}
-
-		tracing::debug!("Audio packet stream stopped.");
-	});
+	tracing::debug!("Audio packet stream stopped.");
 }
 
 #[cfg(test)]
 mod tests {
+	use std::time::Duration;
+
 	use super::*;
 
 	#[tokio::test]
 	async fn shutdown_before_start_releases_packet_handler() {
-		let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
 		let (packet_tx, packet_rx) = mpsc::channel(1);
 		let start = StartSignal::new();
 		let stop = ShutdownManager::new();
-		spawn_handle_audio_packets(packet_rx, socket, AvPingToken::new().unwrap(), start.waiter(), stop.clone());
+		spawn_handle_audio_packets(
+			packet_rx,
+			Arc::clone(&socket),
+			AvPingToken::new().unwrap(),
+			start.waiter(),
+			stop.clone(),
+		)
+		.unwrap();
 
 		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
-		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
+		tokio::time::timeout(Duration::from_secs(1), stop.wait_shutdown_complete())
 			.await
-			.expect("packet handler kept its socket after shutdown");
+			.expect("packet handler did not stop while waiting for start");
+		assert!(packet_tx.is_closed());
+		assert_eq!(Arc::strong_count(&socket), 1);
 	}
 }

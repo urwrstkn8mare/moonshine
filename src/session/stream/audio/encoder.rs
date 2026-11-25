@@ -1,4 +1,7 @@
+use std::time::Duration;
+
 use async_shutdown::ShutdownManager;
+use crossbeam_channel::RecvTimeoutError;
 use fec_rs::ReedSolomon;
 use tokio::sync::mpsc;
 
@@ -102,9 +105,14 @@ impl AudioEncoder {
 			.map_err(|e| tracing::warn!("Failed to create FEC encoder: {e}"))?;
 
 		let inner = AudioEncoderInner {};
+		let delay_stop = stop
+			.delay_shutdown_token()
+			.map_err(|e| tracing::debug!("Cannot start audio encoder: {e}"))?;
 		std::thread::Builder::new()
 			.name("audio-encode".to_string())
 			.spawn(move || {
+				// Keep the generation alive until run() has dropped its codec and channels.
+				let _delay_stop = delay_stop;
 				inner.run(
 					frame_rx,
 					frame_recycle_tx,
@@ -141,9 +149,7 @@ impl AudioEncoderInner {
 		stop: ShutdownManager<SessionShutdownReason>,
 		mut start: StartWaiter,
 	) {
-		// Trigger session shutdown when the audio encoder stops.
-		let _session_stop_token = stop.trigger_shutdown_token(SessionShutdownReason::AudioEncoderStopped);
-		let _delay_stop = stop.delay_shutdown_token();
+		let _stop_token = stop.trigger_shutdown_token(SessionShutdownReason::AudioEncoderStopped);
 
 		// Wait for the start signal before entering the encode loop.
 		let rt = tokio::runtime::Builder::new_current_thread()
@@ -189,9 +195,10 @@ impl AudioEncoderInner {
 		}
 
 		while !stop.is_shutdown_triggered() {
-			let frame = match frame_rx.recv() {
+			let frame = match frame_rx.recv_timeout(Duration::from_millis(10)) {
 				Ok(frame) => frame,
-				Err(_) => {
+				Err(RecvTimeoutError::Timeout) => continue,
+				Err(RecvTimeoutError::Disconnected) => {
 					tracing::debug!("PulseServer channel closed.");
 					break;
 				},
@@ -356,7 +363,48 @@ impl AudioEncoderInner {
 
 #[cfg(test)]
 mod tests {
-	use super::AudioRtpClock;
+	use crate::session::SessionKeyData;
+	use crate::session::stream::StartSignal;
+	use crate::session::stream::audio::{OPUS_STEREO, SINK_SAMPLE_RATE};
+
+	use super::*;
+
+	#[tokio::test]
+	async fn shutdown_completes_while_encoder_waits_for_frames() {
+		let (_frame_tx, frame_rx) = crossbeam_channel::bounded(3);
+		let (recycle_tx, recycle_rx) = crossbeam_channel::bounded(3);
+		let (packet_tx, mut packet_rx) = mpsc::channel(1);
+		let (_keys_tx, keys_rx) = tokio::sync::watch::channel(SessionKeyData {
+			remote_input_key: vec![0; 16],
+			remote_input_key_id: 0,
+		});
+		let start = StartSignal::new();
+		let stop = ShutdownManager::new();
+		AudioEncoder::spawn(
+			SINK_SAMPLE_RATE,
+			5,
+			&OPUS_STEREO,
+			frame_rx,
+			recycle_tx,
+			keys_rx,
+			false,
+			packet_tx,
+			stop.clone(),
+			start.waiter(),
+		)
+		.unwrap();
+
+		start.trigger();
+		recycle_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
+		tokio::time::timeout(Duration::from_secs(1), stop.wait_shutdown_complete())
+			.await
+			.expect("encoder did not stop while the frame channel was still open");
+		assert!(matches!(
+			packet_rx.try_recv(),
+			Err(mpsc::error::TryRecvError::Disconnected)
+		));
+	}
 
 	#[test]
 	fn timestamps_match_moonlight_audio_fec_block_layout() {

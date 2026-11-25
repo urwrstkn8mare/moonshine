@@ -9,8 +9,8 @@ mod hdr_sei;
 
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use async_shutdown::ShutdownManager;
@@ -272,19 +272,8 @@ struct FrameContext {
 	content: Option<FrameColorSpace>,
 }
 
-/// Message from the encoding thread to the packet consumer thread, in
-/// submission order.
-enum ConsumerMessage {
-	/// A submitted frame's context together with the [`EncodeFuture`] that
-	/// resolves with its encoded packet. Awaiting the future yields the packet
-	/// for exactly this frame, so context and packet are paired by construction.
-	Frame(FrameContext, EncodeFuture),
-	/// Reset the RTP/frame counters (client reconnect/resume), so subsequent
-	/// packets restart from frame 1. Ordered with `Frame` messages so it takes
-	/// effect before any frame submitted after the reset. Carries the reset's
-	/// epoch, which tags later packet batches so stale ones can be dropped.
-	ResetCounters(u32),
-}
+/// An encoded frame in flight, with the context from its submission.
+type SubmittedFrame = (FrameContext, EncodeFuture);
 
 /// Decrements the in-flight frame counter when dropped: on an early `continue`
 /// in the consumer loop, or when the network sender takes the frame's
@@ -298,35 +287,31 @@ struct InFlightGuard(Arc<AtomicUsize>);
 /// so a sender that stops draining (a stalled socket) fills the slots and the
 /// encoding thread drops new captures instead of frames queueing up behind the
 /// socket. The sender releases the slot as it takes the batch with
-/// [`PacketBatch::into_parts`], before writing it to the socket, so the send
+/// [`PacketBatch::into_shards`], before writing it to the socket, so the send
 /// itself (e.g. waiting for a large keyframe to fit in the socket buffer) and
 /// the data still queued in the socket afterwards don't count against the
 /// limit.
 pub(super) struct PacketBatch {
-	epoch: u32,
 	shards: ShardBatch,
 	in_flight: InFlightGuard,
 }
 
 impl PacketBatch {
-	/// Release the frame's in-flight slot and return the reset epoch the frame
-	/// was packetized in (see [`ConsumerMessage::ResetCounters`]) and its shards.
+	/// Release the frame's in-flight slot and return its shards.
 	///
 	/// The slot is released here, when the sender dequeues the batch, not when
 	/// its shards are sent or leave the host.
-	pub(super) fn into_parts(self) -> (u32, ShardBatch) {
+	pub(super) fn into_shards(self) -> ShardBatch {
 		drop(self.in_flight);
-		(self.epoch, self.shards)
+		self.shards
 	}
 
-	/// An empty batch holding a new in-flight slot, as the encoding thread and
-	/// the consumer would produce it.
+	/// A batch holding a new in-flight slot, as the consumer would produce it.
 	#[cfg(test)]
-	pub(super) fn holding_slot(in_flight: &Arc<AtomicUsize>) -> Self {
+	pub(super) fn holding_slot(in_flight: &Arc<AtomicUsize>, shards: ShardBatch) -> Self {
 		in_flight.fetch_add(1, Ordering::Relaxed);
 		Self {
-			epoch: 0,
-			shards: ShardBatch::empty(),
+			shards,
 			in_flight: InFlightGuard(in_flight.clone()),
 		}
 	}
@@ -335,6 +320,103 @@ impl PacketBatch {
 impl Drop for InFlightGuard {
 	fn drop(&mut self) {
 		self.0.fetch_sub(1, Ordering::Relaxed);
+	}
+}
+
+/// Wire state is local to a generation. Moonlight expects a new stream's first
+/// frame index to be 1, with an RTP sequence and presentation clock starting at zero.
+pub(super) struct FramePacketizer {
+	packetizer: Packetizer,
+	frame_number: u32,
+	sequence_number: u32,
+	rtp_epoch: Option<Instant>,
+	next_rtp_ticks: u64,
+}
+
+impl FramePacketizer {
+	pub(super) fn new(packetizer: Packetizer) -> Self {
+		Self {
+			packetizer,
+			frame_number: 0,
+			sequence_number: 0,
+			rtp_epoch: None,
+			next_rtp_ticks: 0,
+		}
+	}
+
+	fn has_sent_frame(&self) -> bool {
+		self.frame_number != 0
+	}
+
+	pub(super) fn packetize(
+		&mut self,
+		data: &[u8],
+		frame_type: FrameType,
+		created_at: Instant,
+		latency_100us: u16,
+		ctx: &VideoStreamContext,
+		config: &VideoStreamConfig,
+	) -> Result<(u32, ShardBatch), ()> {
+		// Clients take the 90 kHz RTP timestamp as the presentation time. A
+		// re-encode can be stamped after the capture time of the next frame.
+		let epoch = *self.rtp_epoch.get_or_insert(created_at);
+		let elapsed = created_at.duration_since(epoch);
+		let ticks = ((elapsed.as_micros() * 90_000 / 1_000_000) as u64).max(self.next_rtp_ticks);
+		let first = !self.has_sent_frame();
+		self.next_rtp_ticks = ticks + 1;
+		self.frame_number += 1;
+
+		match self.packetizer.packetize(
+			data,
+			frame_type,
+			ctx.packet_size,
+			ctx.minimum_fec_packets,
+			config.fec_percentage,
+			self.frame_number,
+			&mut self.sequence_number,
+			ticks as u32,
+			latency_100us,
+		) {
+			Ok(shards) => Ok((self.frame_number, shards)),
+			Err(()) => {
+				// No packet from this generation has reached the client yet.
+				if first {
+					self.frame_number = 0;
+					self.sequence_number = 0;
+					self.rtp_epoch = None;
+					self.next_rtp_ticks = 0;
+				}
+				Err(())
+			},
+		}
+	}
+}
+
+/// Downsample captures only when the retained compositor can run faster than
+/// the negotiated stream. Stay on the target schedule instead of accumulating
+/// each capture's timing jitter, but don't catch up a backlog after an idle gap.
+struct CaptureCadence {
+	interval: Duration,
+	slack: Duration,
+	next: Option<Instant>,
+}
+
+impl CaptureCadence {
+	fn new(capture_fps: u32, fps: u32, interval: Duration) -> Option<Self> {
+		(capture_fps > fps).then(|| Self {
+			interval,
+			slack: Duration::from_secs_f64(0.5 / f64::from(capture_fps)),
+			next: None,
+		})
+	}
+
+	fn accepts(&mut self, captured_at: Instant) -> bool {
+		let earliest_slot = self.next.unwrap_or(captured_at);
+		if captured_at + self.slack < earliest_slot {
+			return false;
+		}
+		self.next = Some(earliest_slot.max(captured_at - self.slack) + self.interval);
+		true
 	}
 }
 
@@ -354,40 +436,22 @@ impl Drop for InFlightGuard {
 /// thread's drop-to-catch-up gate reads.
 #[allow(clippy::too_many_arguments)]
 async fn run_packet_consumer(
-	mut ctx_rx: mpsc::Receiver<ConsumerMessage>,
+	mut ctx_rx: mpsc::Receiver<SubmittedFrame>,
 	packet_tx: mpsc::Sender<PacketBatch>,
-	stats_tx: StatsSender,
+	stats: StreamStoppedOnDrop,
 	in_flight: Arc<AtomicUsize>,
 	idr_tx: broadcast::Sender<()>,
-	mut packetizer: Packetizer,
+	mut packetizer: FramePacketizer,
 	ctx: VideoStreamContext,
 	config: VideoStreamConfig,
 ) {
-	let mut frame_number = 0u32;
-	let mut sequence_number = 0u32;
-	let mut reset_epoch = 0u32;
 	let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
 	let mut last_summary_time = std::time::Instant::now();
 	let frame_interval_us = 1_000_000 / ctx.fps as u128;
-	let mut epoch = None;
-	let mut next_rtp_ticks = 0u64;
-
-	// Driven by the message channel: one `Frame` per submitted frame. When the
+	// Driven by the message channel: one entry per submitted frame. When the
 	// encoding thread drops its sender, this loop ends after the last frame.
-	while let Some(msg) = ctx_rx.recv().await {
-		let (frame_context, future) = match msg {
-			ConsumerMessage::ResetCounters(epoch) => {
-				frame_number = 0;
-				sequence_number = 0;
-				reset_epoch = epoch;
-				continue;
-			},
-			ConsumerMessage::Frame(frame_context, future) => (frame_context, future),
-		};
-
-		// This frame is in flight until the network sender takes its batch: the
-		// slot travels with the batch below, and the early `continue`s release it
-		// here.
+	while let Some((frame_context, future)) = ctx_rx.recv().await {
+		// The slot travels with the batch below; all early exits release it here.
 		let in_flight_slot = InFlightGuard(in_flight.clone());
 
 		let t_wait_started = std::time::Instant::now();
@@ -407,6 +471,9 @@ async fn run_packet_consumer(
 					let _ = idr_tx.send(());
 				} else {
 					tracing::warn!("Failed to read back encoded frame: {e}");
+					if !packetizer.has_sent_frame() {
+						let _ = idr_tx.send(());
+					}
 				}
 				continue;
 			},
@@ -431,15 +498,12 @@ async fn run_packet_consumer(
 		let encoded_bytes = packet.data.len();
 		let is_key_frame = packet.is_key_frame();
 
-		// Clients take the RTP timestamp (90 kHz) as the frame's presentation time.
-		let epoch = *epoch.get_or_insert(frame_context.created_at);
-		let since_epoch = frame_context.created_at.duration_since(epoch);
-		// A re-encoded frame is stamped when it is encoded, which can be later
-		// than the capture time of a frame still in the queue.
-		let rtp_ticks = ((since_epoch.as_micros() * 90_000 / 1_000_000) as u64).max(next_rtp_ticks);
-		next_rtp_ticks = rtp_ticks + 1;
-		let rtp_timestamp = rtp_ticks as u32;
-		frame_number += 1;
+		// A fresh encoder starts with an IDR. If readback of that IDR failed,
+		// don't hand the client predicted frames it cannot decode.
+		if !packetizer.has_sent_frame() && !is_key_frame {
+			let _ = idr_tx.send(());
+			continue;
+		}
 
 		let t_start = std::time::Instant::now();
 		// Capture-to-packetization latency in 100µs units, clamped to u16::MAX
@@ -455,23 +519,22 @@ async fn run_packet_consumer(
 		} else {
 			FrameType::Predicted
 		};
-		let shards = match packetizer.packetize(
+		let (frame_number, shards) = match packetizer.packetize(
 			&packet.data,
 			frame_type,
-			ctx.packet_size,
-			ctx.minimum_fec_packets,
-			config.fec_percentage,
-			frame_number,
-			&mut sequence_number,
-			rtp_timestamp,
+			frame_context.created_at,
 			latency_100us,
+			&ctx,
+			&config,
 		) {
 			Ok(shards) => shards,
-			// Drop just this frame rather than tearing down the session: the
-			// client sees a gap (the frame number was already consumed) and
-			// requests an IDR, which recovers the stream.
+			// Drop just this frame rather than tearing down the session. For
+			// an established stream the client sees a gap and requests an IDR.
 			Err(()) => {
 				tracing::warn!("Failed to packetize encoded frame");
+				if !packetizer.has_sent_frame() {
+					let _ = idr_tx.send(());
+				}
 				continue;
 			},
 		};
@@ -483,7 +546,6 @@ async fn run_packet_consumer(
 		// then sees its `frame_ctx_tx` fail and exits too, which drops the
 		// video-pipeline shutdown token and tears the session down.
 		let batch = PacketBatch {
-			epoch: reset_epoch,
 			shards,
 			in_flight: in_flight_slot,
 		};
@@ -534,7 +596,7 @@ async fn run_packet_consumer(
 			is_key_frame,
 		});
 
-		stats_tx.frame(FrameStats {
+		stats.0.frame(FrameStats {
 			frame_number,
 			captured_at: std::time::SystemTime::now() - frame_context.created_at.elapsed(),
 			content: frame_context.content,
@@ -566,6 +628,7 @@ impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		frames: CompositorFrames,
+		capture_fps: u32,
 		gpu: GpuContext,
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
@@ -574,7 +637,7 @@ impl VideoPipeline {
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: broadcast::Receiver<u32>,
+		nonce_counter: Arc<AtomicU64>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start: StartWaiter,
@@ -583,6 +646,8 @@ impl VideoPipeline {
 		tracing::debug!("Initializing video pipeline.");
 
 		let inner = VideoPipelineInner {
+			capture_fps,
+			nonce_counter,
 			gpu,
 			config,
 			context,
@@ -593,10 +658,14 @@ impl VideoPipeline {
 		// encoding loop can spawn the async packet consumer as a task on it. `new`
 		// is called from within the session runtime, so `current()` is valid here.
 		let runtime = tokio::runtime::Handle::current();
+		let delay_stop = stop_session_manager
+			.delay_shutdown_token()
+			.map_err(|e| tracing::error!("Can't start the video pipeline: {e:?}"))?;
 
 		std::thread::Builder::new()
 			.name("video-pipeline".to_string())
 			.spawn(move || {
+				let _delay_stop = delay_stop;
 				inner.run(
 					runtime,
 					frames,
@@ -604,7 +673,6 @@ impl VideoPipeline {
 					idr_tx,
 					idr_frame_request_rx,
 					invalidate_request_rx,
-					reset_request_rx,
 					stop_session_manager,
 					hdr_metadata_tx,
 					start,
@@ -627,6 +695,8 @@ impl Drop for StreamStoppedOnDrop {
 }
 
 struct VideoPipelineInner {
+	capture_fps: u32,
+	nonce_counter: Arc<AtomicU64>,
 	gpu: GpuContext,
 	config: VideoStreamConfig,
 	context: VideoStreamContext,
@@ -643,7 +713,6 @@ impl VideoPipelineInner {
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		mut start: StartWaiter,
@@ -654,7 +723,6 @@ impl VideoPipelineInner {
 		// Trigger session shutdown if we exit unexpectedly.
 		let _session_stop_token =
 			stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoEncoderStopped);
-		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
 		// Wait for the start signal before entering the encode loop.
 		let rt = tokio::runtime::Builder::new_current_thread()
@@ -674,12 +742,15 @@ impl VideoPipelineInner {
 				return;
 			},
 		};
+		if stop_session_manager.is_shutdown_triggered() {
+			return;
+		}
 
-		// Stats readers learn the stream's parameters before its first frame, and that it ended
-		// once its last frame is sent, however the loop exits. The session doesn't finish stopping
-		// until this thread is done, so the next stream starts after this one has stopped.
+		// Stats readers learn the parameters before the first frame, and the
+		// consumer emits Stopped after its last frame. Both workers delay
+		// shutdown, so only then can the next generation start.
 		stats_tx.started(StreamInfo::from(&self.context));
-		let _stopped = StreamStoppedOnDrop(stats_tx.clone());
+		let stats = StreamStoppedOnDrop(stats_tx);
 
 		// Start the capture and encoding loop.
 		if let Err(e) = self.run_encoding_loop(
@@ -691,10 +762,9 @@ impl VideoPipelineInner {
 			idr_tx,
 			idr_frame_request_rx,
 			invalidate_request_rx,
-			reset_request_rx,
 			stop_session_manager,
 			hdr_metadata_tx,
-			stats_tx,
+			stats,
 		) {
 			tracing::error!("Video encoding loop failed: {e}");
 		}
@@ -795,10 +865,9 @@ impl VideoPipelineInner {
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		mut reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
-		stats_tx: StatsSender,
+		stats: StreamStoppedOnDrop,
 	) -> Result<(), String> {
 		let ctx = &self.context;
 
@@ -807,8 +876,9 @@ impl VideoPipelineInner {
 			return Err("The compositor was not launched".to_string());
 		};
 
-		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
+		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone(), self.nonce_counter.clone());
 		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
+		let packetizer = FramePacketizer::new(packetizer);
 
 		// The encoder is asynchronous: each `submit()` returns a future that
 		// resolves with that frame's packet once the GPU finishes. We hand each
@@ -824,7 +894,7 @@ impl VideoPipelineInner {
 		// is sized just above that gate so it never actually blocks the producer —
 		// admission is governed by the drop gate, not by the channel filling.
 		let in_flight = Arc::new(AtomicUsize::new(0));
-		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMessage>(MAX_FRAMES_IN_FLIGHT + 2);
+		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<SubmittedFrame>(MAX_FRAMES_IN_FLIGHT + 2);
 		// Lets the drop warning tell a backed-up send queue (network) from frames
 		// still encoding (GPU). Weak, so it doesn't keep the channel open.
 		let send_queue = packet_tx.downgrade();
@@ -832,22 +902,30 @@ impl VideoPipelineInner {
 			let ctx = self.context.clone();
 			let config = self.config.clone();
 			let in_flight = in_flight.clone();
+			let idr_tx = idr_tx.clone();
+			let delay_stop = stop_session_manager
+				.delay_shutdown_token()
+				.map_err(|e| format!("Can't start the video packet consumer: {e:?}"))?;
 			// The packetize/send half is pure async work (await the encode future,
 			// packetize, send) with no blocking GPU calls, so it runs as a task on
 			// moonshine's main runtime — a green thread multiplexed with the rest of
 			// the session — rather than its own OS thread. Only this capture/encode
 			// loop needs a real thread, as it blocks on the frame channel and the
 			// Vulkan submit path.
-			runtime.spawn(run_packet_consumer(
-				frame_ctx_rx,
-				packet_tx,
-				stats_tx,
-				in_flight,
-				idr_tx.clone(),
-				packetizer,
-				ctx,
-				config,
-			))
+			runtime.spawn(async move {
+				let _delay_stop = delay_stop;
+				run_packet_consumer(
+					frame_ctx_rx,
+					packet_tx,
+					stats,
+					in_flight,
+					idr_tx,
+					packetizer,
+					ctx,
+					config,
+				)
+				.await;
+			})
 		};
 
 		// Rate-limits the drop-to-catch-up warning.
@@ -855,6 +933,7 @@ impl VideoPipelineInner {
 
 		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
+		let mut cadence = CaptureCadence::new(self.capture_fps, ctx.fps, frame_interval);
 		let mut last_frame_time = std::time::Instant::now();
 
 		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
@@ -865,63 +944,26 @@ impl VideoPipelineInner {
 
 		// Reference frame invalidation maps the client's frame indices (what the
 		// packet consumer stamps into outgoing packets) to pixelforge's display
-		// order (`pts`). The consumer numbers successfully-sent frames from 1
-		// within an epoch, and pixelforge's display order increments once per
-		// submitted frame, so within an epoch:
-		//     display_order = frame_number_base + (client_frame_index - 1).
-		// `submitted_count` is the display order the next submitted frame will
-		// carry; `frame_number_base` is the display order of the first frame of
-		// the current epoch and advances on reset (which restarts the consumer's
-		// numbering). A rare readback drop can skew this by a frame, which at
-		// worst over-invalidates into a (safe) IDR, or makes `covered_by` skip a new
-		// loss until the client's reports pass the last answer (a short delay).
+		// order (`pts`). A fresh encoder and packetizer both count from zero,
+		// with 1-based frame indices on the wire: display_order = frame_index - 1.
+		// A rare readback drop can skew this, which at worst over-invalidates
+		// into a (safe) IDR or suppresses reports until they pass the last answer.
 		let mut submitted_count: u64 = 0;
-		let mut frame_number_base: u64 = 0;
 		// The last invalidation answered, for `covered_by`.
 		let mut last_invalidation: Option<(u64, u64)> = None;
 		// An invalidation recovered and its recovery frame isn't submitted yet: the client
 		// drops every frame until it arrives, so a static screen re-encodes the last frame.
 		let mut pending_recovery = false;
+		// A capture skipped for cadence or backpressure may leave an IDR request
+		// pending; keep it eligible for re-encoding if the screen goes idle.
+		let mut pending_idr = false;
 
 		// Track the last HDR mode state sent to the control stream.
-		let mut last_hdr_state = HdrModeState {
-			enabled: ctx.dynamic_range == VideoDynamicRange::Hdr,
-			metadata: None,
-		};
+		let mut last_hdr_state = HdrModeState::new(ctx.dynamic_range == VideoDynamicRange::Hdr);
 
-		while !stop_session_manager.is_shutdown_triggered() {
-			let mut pending_idr = false;
-
-			// Drain any pending stream-reset requests (client reconnect/resume).
-			//
-			// Moonlight starts every (re)connected session with its frame counter at 1
-			// and waits for an IDR. Because we keep the pipeline running across a resume,
-			// `frame_number` keeps climbing, so a reconnecting client would see the first
-			// frame's index as a huge jump from its expected 1 — counted as ~100% frame
-			// loss within its sampling window, which immediately trips CONN_STATUS_POOR
-			// ("Your network connection isn't performing well"). Reset the frame and RTP
-			// sequence counters and force an IDR so the resumed client sees a clean stream
-			// starting from frame 1.
-			let mut pending_reset = None;
-			loop {
-				match reset_request_rx.try_recv() {
-					Ok(epoch) => pending_reset = Some(epoch),
-					// The newest epoch is still queued; the next try_recv returns it.
-					Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
-					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
-				}
-			}
-			if let Some(epoch) = pending_reset {
-				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
-				// Counters live on the consumer task; reset them in order.
-				let _ = frame_ctx_tx.blocking_send(ConsumerMessage::ResetCounters(epoch));
-				// The next submitted frame becomes the consumer's frame 1 of the
-				// new epoch; anchor the invalidation index mapping to it.
-				frame_number_base = submitted_count;
-				last_invalidation = None;
-				pending_recovery = false;
-				encoder.request_idr();
-				pending_idr = true;
+		let result = 'encode: loop {
+			if stop_session_manager.is_shutdown_triggered() {
+				break Ok(());
 			}
 
 			// Drain any pending IDR requests.
@@ -948,8 +990,8 @@ impl VideoPipelineInner {
 			loop {
 				match invalidate_request_rx.try_recv() {
 					Ok((first, last)) => {
-						let first_display_order = frame_number_base + (first.max(1) as u64 - 1);
-						let last_display_order = frame_number_base + (last.max(1) as u64 - 1);
+						let first_display_order = u64::from(first.saturating_sub(1));
+						let last_display_order = u64::from(last.saturating_sub(1));
 						if covered_by(last_invalidation, first_display_order, last_display_order) {
 							tracing::trace!(
 								"Skipping reference frame invalidation from client frame {first}, already answered"
@@ -988,6 +1030,7 @@ impl VideoPipelineInner {
 						tracing::debug!("Re-encoding last frame for IDR or recovery (no re-import)");
 						// Use current time as created_at for the re-encoded IDR (no actual frame).
 						let now = std::time::Instant::now();
+						pending_idr = false;
 						match encoder.repeat() {
 							Ok(future) => {
 								let submitted_at = std::time::Instant::now();
@@ -1009,10 +1052,12 @@ impl VideoPipelineInner {
 								in_flight.fetch_add(1, Ordering::Relaxed);
 								submitted_count += 1;
 								pending_recovery = false;
-								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(frame_context, future));
+								let _ = frame_ctx_tx.blocking_send((frame_context, future));
 							},
 							Err(PixelForgeError::DeviceLost) => {
-								return Err("Failed to re-encode frame for IDR request: the GPU was lost".to_string());
+								break 'encode Err(
+									"Failed to re-encode frame for IDR request: the GPU was lost".to_string()
+								);
 							},
 							Err(e) => {
 								tracing::warn!("Failed to re-encode frame for IDR or recovery: {e}");
@@ -1033,7 +1078,7 @@ impl VideoPipelineInner {
 				Err(ferriscope::RecvTimeoutError::Disconnected) => {
 					tracing::debug!("Frame channel disconnected - compositor stopped");
 					let _ = stop_session_manager.trigger_shutdown(SessionShutdownReason::CompositorStopped);
-					break;
+					break Ok(());
 				},
 			};
 
@@ -1063,6 +1108,12 @@ impl VideoPipelineInner {
 						}
 						last_drop_warn = Some(std::time::Instant::now());
 					}
+					continue;
+				}
+				if cadence
+					.as_mut()
+					.is_some_and(|cadence| !cadence.accepts(frame.info.captured_at))
+				{
 					continue;
 				}
 
@@ -1153,12 +1204,12 @@ impl VideoPipelineInner {
 					VideoDynamicRange::Hdr => frame_colors(content, ctx.full_range),
 				};
 				let was_hdr = is_hdr(&encoder);
-				encoder
-					.reconfigure(
-						Source::Rgb(RgbSource::new(frame_input_format, frame_source)),
-						stream_color,
-					)
-					.map_err(|e| format!("Failed to reconfigure the encoder for the frame: {e}"))?;
+				if let Err(e) = encoder.reconfigure(
+					Source::Rgb(RgbSource::new(frame_input_format, frame_source)),
+					stream_color,
+				) {
+					break Err(format!("Failed to reconfigure the encoder for the frame: {e}"));
+				}
 				if is_hdr(&encoder) != was_hdr {
 					tracing::debug!(
 						"Switched encoder to {stream_color:?} for a {frame_input_format:?} {frame_source:?} frame (conversion \
@@ -1230,9 +1281,8 @@ impl VideoPipelineInner {
 						in_flight.fetch_add(1, Ordering::Relaxed);
 						submitted_count += 1;
 						pending_recovery = false;
-						let consumer_gone = frame_ctx_tx
-							.blocking_send(ConsumerMessage::Frame(frame_context, future))
-							.is_err();
+						pending_idr = false;
+						let consumer_gone = frame_ctx_tx.blocking_send((frame_context, future)).is_err();
 
 						// The encoder reads the frame after `submit` returns. Once it
 						// has, dropping the frame returns its buffer to the compositor.
@@ -1246,11 +1296,11 @@ impl VideoPipelineInner {
 
 						if consumer_gone {
 							tracing::debug!("Packet consumer gone; stopping encoding loop.");
-							break;
+							break 'encode Ok(());
 						}
 					},
 					Err(PixelForgeError::DeviceLost) => {
-						return Err("Failed to encode frame: the GPU was lost".to_string());
+						break 'encode Err("Failed to encode frame: the GPU was lost".to_string());
 					},
 					Err(e) => tracing::warn!("Failed to encode frame: {e}"),
 				}
@@ -1261,7 +1311,7 @@ impl VideoPipelineInner {
 
 				has_encoded = true;
 			}
-		}
+		};
 
 		// Drain in-flight encodes (barrier so every packet reaches the channel),
 		// then stop the consumer and wait for it to send the remaining packets.
@@ -1275,14 +1325,13 @@ impl VideoPipelineInner {
 			tracing::warn!("Packet consumer task panicked: {e:?}");
 		}
 
-		Ok(())
+		result
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use super::covered_by;
-	use super::drm_fourcc_to_input;
+	use super::{CaptureCadence, Duration, Instant, covered_by, drm_fourcc_to_input};
 	use ash::vk;
 	use pixelforge::RgbFormat;
 
@@ -1295,6 +1344,25 @@ mod tests {
 	const XBGR2101010: u32 = 0x30334258; // "XB30"
 	const ABGR16161616F: u32 = 0x48344241; // "AB4H"
 	const XBGR16161616F: u32 = 0x48344258; // "XB4H"
+
+	#[test]
+	fn cadence_only_caps_a_faster_compositor() {
+		let interval = Duration::from_millis(20);
+		assert!(CaptureCadence::new(50, 50, interval).is_none());
+		assert!(CaptureCadence::new(40, 50, interval).is_none());
+
+		let mut cadence = CaptureCadence::new(100, 50, interval).unwrap();
+		let first = Instant::now();
+		for (ms, accepted) in [(0, true), (8, false), (18, true), (27, false), (39, true)] {
+			assert_eq!(cadence.accepts(first + Duration::from_millis(ms)), accepted);
+		}
+		// Accept the first frame after idle, but skip extra captures rather
+		// than trying to refill the target cadence's missed slots.
+		let after_idle = first + Duration::from_secs(1);
+		assert!(cadence.accepts(after_idle));
+		assert!(!cadence.accepts(after_idle + Duration::from_millis(8)));
+		assert!(cadence.accepts(after_idle + Duration::from_millis(19)));
+	}
 
 	#[test]
 	fn covered_by_skips_only_repeats_of_the_answered_loss() {

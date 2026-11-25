@@ -14,7 +14,7 @@ pub mod video;
 pub(crate) use start::{StartSignal, StartWaiter};
 
 /// The 16 printable bytes advertised in RTSP SETUP and echoed by audio and video pings.
-/// Resuming a session keeps the token because it keeps the same UDP handlers.
+/// Each resumed media connection advertises a new token.
 #[derive(Clone, Copy)]
 pub(crate) struct AvPingToken([u8; 16]);
 

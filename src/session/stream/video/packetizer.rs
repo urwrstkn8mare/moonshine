@@ -4,6 +4,8 @@ use aes_gcm::{
 };
 use fec_rs::ReedSolomon;
 use std::collections::{HashMap, hash_map::Entry};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::session::SessionKeysReceiver;
@@ -150,19 +152,19 @@ pub(crate) struct Packetizer {
 	cipher: Option<Aes128Gcm>,
 	/// Last seen `remote_input_key_id` — used to detect key rotation.
 	last_key_id: i64,
-	/// Monotonically increasing IV counter (one increment per encrypted shard).
-	gcm_iv_counter: u64,
+	/// Counter shared by packetizers that may encrypt with the same session key.
+	nonce_counter: Arc<AtomicU64>,
 }
 
 impl Packetizer {
-	pub fn new(encrypt: bool, keys_rx: SessionKeysReceiver) -> Self {
+	pub fn new(encrypt: bool, keys_rx: SessionKeysReceiver, nonce_counter: Arc<AtomicU64>) -> Self {
 		Self {
 			fec_encoders: HashMap::new(),
 			keys_rx,
 			encrypt,
 			cipher: None,
 			last_key_id: i64::MIN,
-			gcm_iv_counter: 0,
+			nonce_counter,
 		}
 	}
 
@@ -187,7 +189,6 @@ impl Packetizer {
 		}
 		let key = Key::<Aes128Gcm>::from_slice(&keys.remote_input_key);
 		self.cipher = Some(Aes128Gcm::new(key));
-		self.gcm_iv_counter = 0;
 		tracing::debug!("Video encryption cipher updated for key_id={}", self.last_key_id);
 	}
 
@@ -405,12 +406,12 @@ impl Packetizer {
 
 			// Encrypt each shard if video encryption is enabled.
 			if let Some(cipher) = &self.cipher {
+				let first_counter = self.nonce_counter.fetch_add(total_shards as u64, Ordering::Relaxed);
 				for shard_index in 0..total_shards {
 					// Build the 12-byte IV: bytes 0..8 = counter (LE), byte 11 = 'V'.
 					let mut iv = [0u8; 12];
-					iv[..8].copy_from_slice(&self.gcm_iv_counter.to_le_bytes());
+					iv[..8].copy_from_slice(&(first_counter + shard_index as u64).to_le_bytes());
 					iv[11] = b'V';
-					self.gcm_iv_counter += 1;
 
 					let nonce = Nonce::from_slice(&iv);
 
@@ -472,7 +473,7 @@ mod tests {
 			remote_input_key: vec![0x42; 16],
 			remote_input_key_id: 1,
 		});
-		Packetizer::new(false, keys)
+		Packetizer::new(false, keys, Arc::default())
 	}
 
 	/// A frame that exactly fills `data_shards` packets of 80 bytes.
@@ -480,6 +481,26 @@ mod tests {
 		(0..data_shards * 64 - VIDEO_FRAME_HEADER_SIZE)
 			.map(|index| (index % 251) as u8)
 			.collect()
+	}
+
+	#[test]
+	fn replacing_packetizer_does_not_reuse_encryption_nonces() {
+		let (_, keys) = tokio::sync::watch::channel(crate::session::SessionKeyData {
+			remote_input_key: vec![0x42; 16],
+			remote_input_key_id: 1,
+		});
+		let counter = Arc::new(AtomicU64::new(0));
+		let data = frame(2);
+		let former = Packetizer::new(true, keys.clone(), counter.clone())
+			.packetize(&data, FrameType::Key, 80, 0, 0, 1, &mut 0, 0, 0)
+			.unwrap();
+		let resumed = Packetizer::new(true, keys, counter)
+			.packetize(&data, FrameType::Key, 80, 0, 0, 1, &mut 0, 0, 0)
+			.unwrap();
+		assert_eq!(former.shard_count(), 2);
+		assert_eq!(resumed.shard_count(), 2);
+		let resumed_nonce = u64::from_le_bytes(resumed.as_bytes()[..8].try_into().unwrap());
+		assert_eq!(resumed_nonce, 2);
 	}
 
 	/// The packets of each block, data first, in block order.

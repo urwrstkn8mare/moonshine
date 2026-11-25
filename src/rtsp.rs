@@ -222,6 +222,7 @@ impl RtspServer {
 		&self,
 		request: &rtsp_types::Request<Vec<u8>>,
 		cseq: i32,
+		peer: IpAddr,
 	) -> rtsp_types::Response<Vec<u8>> {
 		let transports = match request.typed_header::<rtsp_types::headers::Transports>() {
 			Ok(transports) => transports,
@@ -282,7 +283,7 @@ impl RtspServer {
 						.header(headers::SESSION, "MoonshineSession;timeout = 90".to_string())
 						.header(headers::TRANSPORT, format!("server_port={port}"));
 					if stream_id != "control" {
-						let Some(token) = self.session_manager.av_ping_token().await else {
+						let Some(token) = self.session_manager.av_ping_token(peer).await else {
 							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::SessionNotFound);
 						};
 						let name = headers::HeaderName::from_static_str("X-SS-Ping-Payload").unwrap();
@@ -317,6 +318,7 @@ impl RtspServer {
 		&self,
 		request: &rtsp_types::Request<Vec<u8>>,
 		cseq: i32,
+		peer: IpAddr,
 	) -> rtsp_types::Response<Vec<u8>> {
 		let sdp_session = match sdp_types::Session::parse(request.body()) {
 			Ok(sdp_session) => sdp_session,
@@ -497,12 +499,10 @@ impl RtspServer {
 
 			(audio_channels, surround_mask)
 		} else {
-			// Fall back to the values from the HTTP launch request.
-			let ctx = self.session_manager.get_session_context().await;
-			match ctx {
-				Ok(Some(session_ctx)) => (session_ctx.audio_channels, session_ctx.audio_channel_mask),
-				_ => (AudioChannels::Stereo, 0x3),
-			}
+			self.session_manager
+				.requested_audio_layout(peer)
+				.await
+				.unwrap_or((AudioChannels::Stereo, 0x3))
 		};
 		let high_quality = audio_quality != 0;
 		let audio_config = AudioConfig::from_channels(channels, channel_mask, high_quality);
@@ -537,7 +537,7 @@ impl RtspServer {
 
 		if self
 			.session_manager
-			.set_stream_context(video_stream_context, audio_stream_context)
+			.set_stream_context(video_stream_context, audio_stream_context, Some(peer))
 			.await
 			.is_err()
 		{
@@ -553,8 +553,9 @@ impl RtspServer {
 		&self,
 		request: &rtsp_types::Request<Vec<u8>>,
 		cseq: i32,
+		peer: IpAddr,
 	) -> rtsp_types::Response<Vec<u8>> {
-		if self.session_manager.start_session().await.is_err() {
+		if self.session_manager.start_session(Some(peer)).await.is_err() {
 			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError);
 		}
 
@@ -614,6 +615,7 @@ impl RtspServer {
 
 		// tracing::trace!("Consumed {} bytes into RTSP request: {:#?}", consumed, message);
 
+		let peer = address.ip().to_canonical();
 		let response = match message {
 			rtsp_types::Message::Request(ref request) => {
 				tracing::debug!("Received RTSP {:?} request", request.method());
@@ -626,11 +628,11 @@ impl RtspServer {
 					.map_err(|e| tracing::warn!("Failed to parse CSeq header: {}", e))?;
 
 				match request.method() {
-					Method::Announce => self.handle_announce_request(request, cseq).await,
+					Method::Announce => self.handle_announce_request(request, cseq, peer).await,
 					Method::Describe => self.handle_describe_request(request, cseq).await,
 					Method::Options => self.handle_options_request(request, cseq),
-					Method::Setup => self.handle_setup_request(request, cseq).await,
-					Method::Play => self.handle_play_request(request, cseq).await,
+					Method::Setup => self.handle_setup_request(request, cseq, peer).await,
+					Method::Play => self.handle_play_request(request, cseq, peer).await,
 					method => {
 						tracing::warn!("Received request with unsupported method {:?}", method);
 						rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest)

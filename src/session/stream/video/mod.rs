@@ -1,7 +1,7 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicU64;
 
-use async_shutdown::ShutdownManager;
+use async_shutdown::{DelayShutdownToken, ShutdownManager};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch};
 
@@ -460,23 +460,20 @@ pub struct VideoStreamContext {
 	pub encrypt_video: bool,
 }
 
-/// Handle returned by `VideoStream::start` that gates the pipeline and packet handler.
-///
-/// The pipeline and packet handler are spawned immediately but wait for the start flag
-/// until `trigger()` is called on `StartB`.
+/// Controls a single video generation. Network encoding waits for both StartB and a
+/// matching video ping; the benchmark can explicitly start without a client.
 #[derive(Clone)]
 pub(crate) struct VideoStreamHandle {
 	start: StartSignal,
+	bench_start: StartSignal,
 	idr_tx: broadcast::Sender<()>,
 	/// Reference frame invalidation requests, carrying the inclusive
 	/// `[first, last]` client frame-index range the client could not decode.
 	invalidate_tx: broadcast::Sender<(u32, u32)>,
-	/// Set by a resume; the packet handler fires the reset on the client's next PING.
-	resume_pending: Arc<AtomicBool>,
 }
 
 impl VideoStreamHandle {
-	/// Signal the video pipeline and packet handler to begin processing.
+	/// Signal StartB so the packet handler starts listening for the client's ping.
 	pub fn trigger(&self) {
 		self.start.trigger();
 	}
@@ -496,29 +493,18 @@ impl VideoStreamHandle {
 		let _ = self.invalidate_tx.send((first, last));
 	}
 
-	/// Reset the stream's frame/sequence counters for a resuming client.
-	///
-	/// Called when a client reconnects to an already-running session. The pipeline
-	/// keeps incrementing `frame_number` for the lifetime of the session, but a fresh
-	/// Moonlight session expects frame numbers to start at 1; without a reset it counts
-	/// the jump as massive frame loss and reports a poor connection. This also forces an
-	/// IDR so the resumed client has a decodable starting frame.
-	///
-	/// The reset waits for the client's next PING: a reconnecting client usually arrives
-	/// from a new UDP port, and firing immediately would send the IDR to the old address.
-	pub fn request_reset(&self) {
-		self.resume_pending.store(true, Ordering::Relaxed);
-	}
-
-	/// The start signal, for external triggering (e.g. bench binary).
+	/// Start encoding for the benchmark without requiring a client's ping.
 	pub fn start_signal(&self) -> StartSignal {
-		self.start.clone()
+		self.bench_start.clone()
 	}
 }
 
 pub(crate) struct VideoStream {
-	socket: UdpGsoSocket,
+	socket: Arc<UdpGsoSocket>,
 	frames: CompositorFrames,
+	capture_fps: u32,
+	/// Nonces must not repeat when a reconnect negotiates the same AES key.
+	nonce_counter: Arc<AtomicU64>,
 	gpu: GpuContext,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
 	stats_tx: StatsSender,
@@ -546,35 +532,33 @@ impl VideoStream {
 		);
 
 		Ok(Self {
-			socket,
+			socket: Arc::new(socket),
 			frames,
+			capture_fps: 0,
+			nonce_counter: Arc::default(),
 			gpu,
 			hdr_metadata_tx,
 			stats_tx,
 		})
 	}
 
+	/// Set the nominal refresh rate of the compositor, which survives media replacements.
+	pub fn with_capture_fps(mut self, fps: u32) -> Self {
+		self.capture_fps = fps;
+		self
+	}
+
 	#[allow(clippy::too_many_arguments)]
 	pub fn start(
-		self,
+		&self,
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		av_ping_token: AvPingToken,
 		keys_rx: SessionKeysReceiver,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<VideoStreamHandle, ()> {
-		let Self {
-			socket,
-			frames,
-			gpu,
-			hdr_metadata_tx,
-			stats_tx,
-		} = self;
-
-		// Apply QoS to UDP socket.
-		if context.qos {
-			let _ = socket.set_tos_v4(160);
-		}
+		let socket = &self.socket;
+		let _ = socket.set_tos_v4(if context.qos { 160 } else { 0 });
 
 		// Room for a keyframe burst, which is several times the average frame,
 		// unless configured otherwise.
@@ -584,8 +568,14 @@ impl VideoStream {
 			socket.set_send_buffer(config.send_buffer_size);
 		}
 
-		// Gate for pipeline + packet handler.
+		// StartB enables transport; a matching ping enables encoding. The benchmark
+		// opens both without a client so it can continue emitting frame stats.
 		let start = StartSignal::new();
+		let bench_start = StartSignal::new();
+		let encode_start = StartSignal::new();
+		let packet_start_waiter = start.waiter();
+		let packet_bench_waiter = bench_start.waiter();
+		let encode_waiter = encode_start.waiter();
 
 		// IDR broadcast channel.
 		let (idr_tx, _idr_rx) = broadcast::channel(1);
@@ -594,29 +584,25 @@ impl VideoStream {
 		// of loss reports; the encode loop drains all pending each iteration.
 		let (invalidate_tx, _invalidate_rx) = broadcast::channel(16);
 
-		// Stream-reset broadcast channel (client reconnect/resume).
-		let (reset_tx, _reset_rx) = broadcast::channel(1);
-		let resume_pending = Arc::new(AtomicBool::new(false));
-
 		// Packet channel. Each queued batch holds its frame's in-flight slot, so the
 		// channel never holds more than the in-flight limit.
 		let (packet_tx, packet_rx) = mpsc::channel::<PacketBatch>(MAX_FRAMES_IN_FLIGHT);
 
-		// Spawn packet handler — gated behind start.
-		spawn_handle_video_packets(
-			packet_rx,
-			socket,
-			av_ping_token,
-			start.waiter(),
-			reset_tx.clone(),
-			resume_pending.clone(),
-			stop.clone(),
-		);
+		// Register the worker before spawning, so shutdown can never finish before
+		// an as-yet-unscheduled task releases its socket and packet channel.
+		let packet_delay = stop
+			.delay_shutdown_token()
+			.map_err(|e| tracing::error!("Can't start video packet handler: {e:?}"))?;
 
-		// Spawn pipeline thread — gated behind start.
+		self.hdr_metadata_tx
+			.send_replace(HdrModeState::new(context.dynamic_range == VideoDynamicRange::Hdr));
+
+		// Spawn the pipeline before the packet handler, since creating its thread
+		// can fail. Both are gated and all waiters exist before StartB is possible.
 		VideoPipeline::new(
-			frames,
-			gpu,
+			self.frames.clone(),
+			self.capture_fps,
+			self.gpu.clone(),
 			config,
 			context,
 			keys_rx,
@@ -624,61 +610,78 @@ impl VideoStream {
 			idr_tx.clone(),
 			idr_tx.subscribe(),
 			invalidate_tx.subscribe(),
-			reset_tx.subscribe(),
+			self.nonce_counter.clone(),
 			stop.clone(),
-			hdr_metadata_tx,
-			start.waiter(),
-			stats_tx,
+			self.hdr_metadata_tx.clone(),
+			encode_waiter,
+			self.stats_tx.clone(),
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 
+		spawn_handle_video_packets(
+			packet_rx,
+			socket.clone(),
+			av_ping_token,
+			packet_start_waiter,
+			packet_bench_waiter,
+			encode_start,
+			stop,
+			packet_delay,
+		);
+
 		Ok(VideoStreamHandle {
 			start,
+			bench_start,
 			idr_tx,
 			invalidate_tx,
-			resume_pending,
 		})
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_handle_video_packets(
-	mut packet_rx: mpsc::Receiver<PacketBatch>,
-	socket: UdpGsoSocket,
+	packet_rx: mpsc::Receiver<PacketBatch>,
+	socket: Arc<UdpGsoSocket>,
 	av_ping_token: AvPingToken,
 	mut start: StartWaiter,
-	reset_tx: broadcast::Sender<u32>,
-	resume_pending: Arc<AtomicBool>,
+	mut bench_start: StartWaiter,
+	encode_start: StartSignal,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+	delay_stop: DelayShutdownToken<SessionShutdownReason>,
 ) {
 	tokio::spawn(async move {
-		if !start.wait(&stop_session_manager).await {
-			return;
+		let _delay_stop = delay_stop;
+		let (mut packet_rx, socket) = (packet_rx, socket);
+		// Trigger session shutdown if we exit unexpectedly.
+		let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
+
+		let bench = tokio::select! {
+			started = start.wait(&stop_session_manager) => if started { false } else { return },
+			started = bench_start.wait(&stop_session_manager) => if started { true } else { return },
+		};
+		if bench {
+			encode_start.trigger();
 		}
+		let mut encode_start = (!bench).then_some(encode_start);
 
 		let mut buf = [0; 1024];
 		let mut client_address = None;
-		// Epoch of the last reset fired; batches packetized before it carry old counters.
-		let mut reset_epoch = 0u32;
 		// Rate-limits the GSO-fallback warning.
 		let mut last_send_warn: Option<std::time::Instant> = None;
 
-		// Trigger session shutdown if we exit unexpectedly.
-		let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
-		let _delay_stop = stop_session_manager.delay_shutdown_token();
-
 		while !stop_session_manager.is_shutdown_triggered() {
 			tokio::select! {
-				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
+				// Don't drain the network queue before finding a client: frame #1
+				// is its initial keyframe. The bench deliberately drains without a peer.
+				batch = stop_session_manager.wrap_cancel(packet_rx.recv()), if encode_start.is_none() => {
 					match batch {
 						Ok(Some(batch)) => {
 							// Taking the batch frees its frame's in-flight slot, so a slow
 							// send doesn't hold back encoding; a stall still fills the
 							// slots with the batches queued behind it.
-							let (epoch, shards) = batch.into_parts();
+							let shards = batch.into_shards();
 							if let Some(addr) = client_address {
-								// Frames from before a resume's reset would reach the new client
-								// with old frame numbers, making it drop the reset frames as stale.
-								if epoch < reset_epoch || shards.shard_count() == 0 {
+								if shards.shard_count() == 0 {
 									continue;
 								}
 
@@ -725,11 +728,8 @@ fn spawn_handle_video_packets(
 						tracing::trace!("Received video stream PING message from {address}.");
 						client_address = Some(address);
 
-						// Fire a resume's reset now that frames reach the client's current address.
-						if resume_pending.swap(false, Ordering::Relaxed) {
-							tracing::info!("Resumed client address is {address}, resetting video stream.");
-							reset_epoch += 1;
-							let _ = reset_tx.send(reset_epoch);
+						if let Some(encode_start) = encode_start.take() {
+							encode_start.trigger();
 						}
 					} else {
 						tracing::warn!("Received unknown message on video stream of length {len}.");
@@ -744,102 +744,233 @@ fn spawn_handle_video_packets(
 
 #[cfg(test)]
 mod tests {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::time::{Duration, Instant};
+
+	use super::packetizer::{FrameType, Packetizer};
+	use super::pipeline::FramePacketizer;
+	use super::shard_batch::ShardBatch;
 	use super::*;
 
-	#[tokio::test]
-	async fn shutdown_before_start_releases_packet_handler() {
-		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
-		let (packet_tx, packet_rx) = mpsc::channel(1);
-		let (reset_tx, _) = broadcast::channel(1);
-		let start = StartSignal::new();
-		let stop = ShutdownManager::new();
-		spawn_handle_video_packets(
-			packet_rx,
-			socket,
-			AvPingToken::new().unwrap(),
-			start.waiter(),
-			reset_tx,
-			Arc::new(AtomicBool::new(false)),
-			stop.clone(),
-		);
+	const TIMEOUT: Duration = Duration::from_secs(1);
 
-		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
-		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
-			.await
-			.expect("packet handler kept its socket after shutdown");
-	}
-
-	#[tokio::test]
-	async fn av_ping_from_resuming_client_triggers_video_reset() {
-		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
-		let address = socket.local_addr().unwrap();
-		let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-		let (_packet_tx, packet_rx) = mpsc::channel(1);
-		let (reset_tx, mut reset_rx) = broadcast::channel(1);
-		let start = StartSignal::new();
-		let stop = ShutdownManager::new();
-		let token = AvPingToken::new().unwrap();
+	fn spawn_test_packet_handler(
+		packet_rx: mpsc::Receiver<PacketBatch>,
+		socket: Arc<UdpGsoSocket>,
+		token: AvPingToken,
+		start: &StartSignal,
+		bench_start: &StartSignal,
+		stop: &ShutdownManager<SessionShutdownReason>,
+	) -> StartWaiter {
+		let encode_start = StartSignal::new();
+		let encode_waiter = encode_start.waiter();
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
 			token,
 			start.waiter(),
-			reset_tx,
-			Arc::new(AtomicBool::new(true)),
+			bench_start.waiter(),
+			encode_start,
 			stop.clone(),
+			stop.delay_shutdown_token().unwrap(),
+		);
+		encode_waiter
+	}
+
+	#[tokio::test]
+	async fn shutdown_before_start_releases_packet_handler() {
+		let socket = Arc::new(UdpGsoSocket::new("127.0.0.1", 0).await.unwrap());
+		let (packet_tx, packet_rx) = mpsc::channel(1);
+		let start = StartSignal::new();
+		let bench_start = StartSignal::new();
+		let stop = ShutdownManager::new();
+		spawn_test_packet_handler(
+			packet_rx,
+			socket.clone(),
+			AvPingToken::new().unwrap(),
+			&start,
+			&bench_start,
+			&stop,
 		);
 
-		start.trigger();
-		let mut ping = [0; 20];
-		ping[..16].copy_from_slice(token.as_str().as_bytes());
-		ping[16..].copy_from_slice(&1u32.to_be_bytes());
-		client.send_to(&ping, address).await.unwrap();
-		let epoch = tokio::time::timeout(std::time::Duration::from_secs(1), reset_rx.recv())
-			.await
-			.expect("video handler did not accept the session's ping")
-			.unwrap();
-		assert_eq!(epoch, 1);
 		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
+		tokio::time::timeout(TIMEOUT, stop.wait_shutdown_complete())
+			.await
+			.unwrap();
+		assert!(packet_tx.is_closed());
+		assert_eq!(Arc::strong_count(&socket), 1);
+	}
+
+	async fn ping(client: &tokio::net::UdpSocket, address: std::net::SocketAddr, token: AvPingToken) {
+		let mut packet = [0; 20];
+		packet[..16].copy_from_slice(token.as_str().as_bytes());
+		packet[16..].copy_from_slice(&1u32.to_be_bytes());
+		client.send_to(&packet, address).await.unwrap();
+	}
+
+	async fn read_video_header(client: &tokio::net::UdpSocket) -> (usize, u16, u32, u32, u8) {
+		let mut packet = [0; 1024];
+		let (len, _) = tokio::time::timeout(TIMEOUT, client.recv_from(&mut packet))
+			.await
+			.expect("video handler did not send the queued frame")
+			.unwrap();
+		assert!(len >= 40);
+		(
+			len,
+			u16::from_be_bytes(packet[2..4].try_into().unwrap()),
+			u32::from_be_bytes(packet[4..8].try_into().unwrap()),
+			u32::from_le_bytes(packet[20..24].try_into().unwrap()),
+			packet[35],
+		)
+	}
+
+	#[tokio::test]
+	async fn resumed_video_waits_for_new_ping_and_starts_with_fresh_rtp_and_keyframe() {
+		let socket = Arc::new(UdpGsoSocket::new("127.0.0.1", 0).await.unwrap());
+		let address = socket.local_addr().unwrap();
+		let former_client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let resumed_client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let former_token = AvPingToken::new().unwrap();
+		let resumed_token = AvPingToken::new().unwrap();
+		let (_, keys) = watch::channel(crate::session::SessionKeyData {
+			remote_input_key: vec![0x42; 16],
+			remote_input_key_id: 1,
+		});
+		let nonce_counter = Arc::new(AtomicU64::new(0));
+		let in_flight = Arc::new(AtomicUsize::new(0));
+		let config = VideoStreamConfig {
+			fec_percentage: 0,
+			..Default::default()
+		};
+		let mut context = VideoStreamContext {
+			packet_size: 256,
+			..Default::default()
+		};
+		let mut former = FramePacketizer::new(Packetizer::new(false, keys.clone(), nonce_counter.clone()));
+		let former_stop = ShutdownManager::new();
+		let start = StartSignal::new();
+		let bench_start = StartSignal::new();
+		let (former_tx, former_rx) = mpsc::channel(1);
+		spawn_test_packet_handler(
+			former_rx,
+			socket.clone(),
+			former_token,
+			&start,
+			&bench_start,
+			&former_stop,
+		);
+		start.trigger();
+		ping(&former_client, address, former_token).await;
+
+		let now = Instant::now();
+		let interval = Duration::from_millis(20);
+		for (kind, captured_at) in [(FrameType::Key, now), (FrameType::Predicted, now + interval)] {
+			let (_, shards) = former
+				.packetize(b"encoded frame", kind, captured_at, 0, &context, &config)
+				.unwrap();
+			former_tx
+				.send(PacketBatch::holding_slot(&in_flight, shards))
+				.await
+				.unwrap();
+		}
+		assert_eq!(
+			read_video_header(&former_client).await,
+			(272, 0, 0, 1, FrameType::Key as u8)
+		);
+		assert_eq!(
+			read_video_header(&former_client).await,
+			(272, 1, 1800, 2, FrameType::Predicted as u8)
+		);
+
+		former_stop
+			.trigger_shutdown(SessionShutdownReason::MediaReplaced)
+			.unwrap();
+		tokio::time::timeout(TIMEOUT, former_stop.wait_shutdown_complete())
+			.await
+			.unwrap();
+		assert!(former_tx.is_closed());
+
+		context.packet_size = 384;
+		let mut resumed = FramePacketizer::new(Packetizer::new(false, keys, nonce_counter));
+		let stop = ShutdownManager::new();
+		let start = StartSignal::new();
+		let (resumed_tx, resumed_rx) = mpsc::channel(1);
+		let mut encode_waiter =
+			spawn_test_packet_handler(resumed_rx, socket, resumed_token, &start, &bench_start, &stop);
+		start.trigger();
+		let (_, shards) = resumed
+			.packetize(b"resumed IDR", FrameType::Key, now + 2 * interval, 0, &context, &config)
+			.unwrap();
+		resumed_tx
+			.send(PacketBatch::holding_slot(&in_flight, shards))
+			.await
+			.unwrap();
+
+		ping(&former_client, address, former_token).await;
+		assert!(
+			tokio::time::timeout(Duration::from_millis(30), encode_waiter.wait(&stop))
+				.await
+				.is_err()
+		);
+		assert_eq!(
+			resumed_tx.capacity(),
+			0,
+			"the first frame was consumed without a matching ping"
+		);
+
+		ping(&resumed_client, address, resumed_token).await;
+		assert!(tokio::time::timeout(TIMEOUT, encode_waiter.wait(&stop)).await.unwrap());
+		assert_eq!(
+			read_video_header(&resumed_client).await,
+			(400, 0, 0, 1, FrameType::Key as u8)
+		);
+		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
+		tokio::time::timeout(TIMEOUT, stop.wait_shutdown_complete())
+			.await
+			.unwrap();
 	}
 
 	#[tokio::test]
 	async fn stalled_sender_fills_in_flight_slots() {
-		use std::sync::atomic::AtomicUsize;
-
-		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let socket = Arc::new(UdpGsoSocket::new("127.0.0.1", 0).await.unwrap());
 		let (packet_tx, packet_rx) = mpsc::channel(MAX_FRAMES_IN_FLIGHT);
-		let (reset_tx, _) = broadcast::channel(1);
 		let start = StartSignal::new();
+		let bench_start = StartSignal::new();
 		let stop = ShutdownManager::new();
-		// Until started, the sender doesn't drain the channel, like a stalled socket.
-		spawn_handle_video_packets(
+		let mut encode_waiter = spawn_test_packet_handler(
 			packet_rx,
 			socket,
 			AvPingToken::new().unwrap(),
-			start.waiter(),
-			reset_tx,
-			Arc::new(AtomicBool::new(false)),
-			stop.clone(),
+			&start,
+			&bench_start,
+			&stop,
 		);
 
 		let in_flight = Arc::new(AtomicUsize::new(0));
 		for _ in 0..MAX_FRAMES_IN_FLIGHT {
-			packet_tx.try_send(PacketBatch::holding_slot(&in_flight)).unwrap();
+			packet_tx
+				.try_send(PacketBatch::holding_slot(&in_flight, ShardBatch::empty()))
+				.unwrap();
 		}
 		// Queued frames keep their slots, so the encoding thread's gate closes and
 		// it drops captures instead of the queue growing.
 		assert_eq!(in_flight.load(Ordering::Relaxed), MAX_FRAMES_IN_FLIGHT);
 		assert_eq!(packet_tx.capacity(), 0);
 
-		// Once the sender drains the queue, the slots free up.
-		start.trigger();
-		tokio::time::timeout(std::time::Duration::from_secs(1), async {
+		// The benchmark enables encoding and frees slots without a ping.
+		bench_start.trigger();
+		assert!(tokio::time::timeout(TIMEOUT, encode_waiter.wait(&stop)).await.unwrap());
+		tokio::time::timeout(TIMEOUT, async {
 			while in_flight.load(Ordering::Relaxed) > 0 {
 				tokio::task::yield_now().await;
 			}
 		})
 		.await
 		.expect("sender kept in-flight slots after taking their batches");
+		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
+		tokio::time::timeout(TIMEOUT, stop.wait_shutdown_complete())
+			.await
+			.unwrap();
 	}
 
 	#[test]

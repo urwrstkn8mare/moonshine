@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Apply newly negotiated video and audio settings when a client resumes a game instead of keeping the old bitrate. The game stays open. Changing resolution or HDR mode, or exceeding the launch refresh rate, still requires a fresh launch.
 - Keep the stream within the bitrate the client asks for: video is encoded below it, so FEC, audio and packet overhead fit inside it, as Sunshine does.
 - Stream audio and video to clients that send Sunshine's ping payload (`X-SS-Ping-Payload`), such as recent Moonlight builds, instead of ignoring their pings and sending nothing; legacy `PING` packets still work.
 - Refuse a PIN for a pairing request that already has one, or that asked more than 5 minutes ago, instead of answering that it was accepted while nothing paired.

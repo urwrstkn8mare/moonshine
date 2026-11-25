@@ -171,11 +171,11 @@ impl Webserver {
 
 							tracing::debug!("HTTP server listening for connections on {http_address}");
 							loop {
-								let (connection, address) = listener
+								let (connection, peer_address) = listener
 									.accept()
 									.await
 									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
-								tracing::trace!("Accepted connection from {address}.");
+								tracing::trace!("Accepted connection from {peer_address}.");
 
 								let address = connection.local_addr().ok().map(unmap_v4_mapped);
 								let mac_address = if let Some(address) = address {
@@ -199,6 +199,7 @@ impl Webserver {
 															server.serve(
 																request,
 																address,
+																unmap_v4_mapped(peer_address).ip(),
 																mac_address.clone(),
 																false,
 																None,
@@ -257,11 +258,11 @@ impl Webserver {
 
 							tracing::debug!("HTTPS server listening for connections on {https_address}");
 							loop {
-								let (connection, address) = listener
+								let (connection, peer_address) = listener
 									.accept()
 									.await
 									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
-								tracing::trace!("Accepted TLS connection from {address}.");
+								tracing::trace!("Accepted TLS connection from {peer_address}.");
 
 								// Handshake in the connection's own task, so one stalled client can't block the listener.
 								tokio::spawn({
@@ -309,6 +310,7 @@ impl Webserver {
 															server.serve(
 																request,
 																address,
+																unmap_v4_mapped(peer_address).ip(),
 																mac_address.clone(),
 																true,
 																peer_cert_fingerprint.clone(),
@@ -355,6 +357,7 @@ impl Webserver {
 		&self,
 		request: Request<hyper::body::Incoming>,
 		local_address: Option<SocketAddr>,
+		peer: IpAddr,
 		mac_address: Option<String>,
 		https: bool,
 		peer_cert_fingerprint: Option<String>,
@@ -410,7 +413,7 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
 					}
-					self.resume(params, local_address).await
+					self.resume(params, local_address, peer).await
 				},
 				(&Method::GET, "/cancel") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
@@ -896,6 +899,7 @@ impl Webserver {
 		&self,
 		mut params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
+		peer: IpAddr,
 	) -> Response<Full<Bytes>> {
 		let remote_input_key = match params.remove("rikey") {
 			Some(remote_input_key) => remote_input_key,
@@ -932,17 +936,18 @@ impl Webserver {
 			},
 		};
 
-		match self
-			.session_manager
-			.update_keys(SessionKeyData {
-				remote_input_key,
-				remote_input_key_id,
-			})
-			.await
-		{
+		let audio_layout = params
+			.get("surroundAudioInfo")
+			.and_then(|value| value.parse::<u32>().ok())
+			.map(|info| (AudioChannels::from_wire_or_stereo((info & 0xFFFF) as u8), info >> 16));
+		let keys = SessionKeyData {
+			remote_input_key,
+			remote_input_key_id,
+		};
+		match self.session_manager.prepare_resume(peer, keys, audio_layout).await {
 			Ok(()) => {},
 			Err(()) => {
-				let message = "Failed to update session keys".to_string();
+				let message = "Failed to prepare session resume".to_string();
 				tracing::warn!("{message}");
 				return xml_error(400, &message);
 			},

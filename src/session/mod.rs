@@ -14,6 +14,7 @@ use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStream;
 use crate::session::stream::control::ControlStreamContext;
 use crate::session::stream::video::StatsSender;
+use crate::session::stream::video::VideoDynamicRange;
 use crate::session::stream::video::VideoStream;
 use crate::session::stream::video::VideoStreamContext;
 use crate::session::stream::video::VideoStreamHandle;
@@ -132,8 +133,8 @@ impl SessionState {
 	fn av_ping_token(&self) -> AvPingToken {
 		match self {
 			Self::Initialized(session) => session.av_ping_token,
-			Self::Launched(session) => session.av_ping_token,
-			Self::Active(session) => session.av_ping_token,
+			Self::Launched(session) => session.resources.av_ping_token,
+			Self::Active(session) => session.resources.av_ping_token,
 		}
 	}
 }
@@ -188,7 +189,8 @@ impl InitializedSession {
 			stop.clone(),
 			stats_tx,
 		)
-		.await?;
+		.await?
+		.with_capture_fps(context.refresh_rate);
 		let control_stream = ControlStream::new(control_config, address, handles.input, stop.clone())?;
 
 		Ok(Self {
@@ -249,12 +251,14 @@ impl InitializedSession {
 		.await?;
 
 		Ok(LaunchedSession {
-			context,
-			av_ping_token,
-			application,
-			video_stream,
-			launched_compositor,
-			audio,
+			resources: SessionResources {
+				context,
+				av_ping_token,
+				_application: application,
+				video_stream,
+				launched_compositor,
+				audio,
+			},
 			control_stream,
 			hdr_metadata_rx,
 		})
@@ -263,19 +267,24 @@ impl InitializedSession {
 
 /// Launched session state — compositor and app running, waiting for RTSP negotiation.
 pub(crate) struct LaunchedSession {
-	context: SessionContext,
-	av_ping_token: AvPingToken,
-	application: Application,
-	video_stream: VideoStream,
-	launched_compositor: LaunchedCompositor,
-	audio: AudioStream,
+	resources: SessionResources,
 	control_stream: ControlStream,
 	hdr_metadata_rx: watch::Receiver<HdrModeState>,
 }
 
+/// The game, display and sockets outlive any one negotiated set of streams.
+struct SessionResources {
+	context: SessionContext,
+	av_ping_token: AvPingToken,
+	_application: Application,
+	video_stream: VideoStream,
+	launched_compositor: LaunchedCompositor,
+	audio: AudioStream,
+}
+
 impl LaunchedSession {
 	pub(crate) fn context(&self) -> &SessionContext {
-		&self.context
+		&self.resources.context
 	}
 
 	pub(crate) async fn start(
@@ -286,54 +295,17 @@ impl LaunchedSession {
 		audio_ctx: AudioStreamContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 		inhibit_sleep: bool,
-	) -> Result<(ActiveSession, StartSignal, StartSignal), ()> {
+	) -> Result<ActiveSession, ()> {
 		let Self {
-			context,
-			av_ping_token,
-			launched_compositor,
-			application,
-			audio,
-			video_stream,
+			mut resources,
 			control_stream,
 			hdr_metadata_rx,
 		} = self;
 
-		// The compositor reports the *effective* HDR: false when HDR was requested
-		// but the GPU fell back to an SDR format.
-		let hdr_effective = launched_compositor.hdr();
-
-		// Extract the watch receiver for streams.
-		let keys_rx = context.keys.clone_rx().ok_or_else(|| {
-			tracing::error!("Session keys not initialized");
-		})?;
-
-		// Start video stream — gated, returns VideoStreamHandle.
-		let video_handle = video_stream
-			.start(video_config, video_ctx, av_ping_token, keys_rx.clone(), stop.clone())
-			.map_err(|()| tracing::error!("Failed to start video stream"))?;
-
-		// Start audio stream — gated, returns its StartSignal.
-		let audio_trigger = audio
-			.start(audio_ctx, av_ping_token, keys_rx)
-			.map_err(|()| tracing::error!("Failed to start audio stream"))?;
-
-		// Clone the start flags for external triggering (e.g. bench binary).
-		let video_start = video_handle.start_signal();
-		let audio_start = audio_trigger.clone();
-
-		// Keep a handle to the video stream so a resuming client can reset its
-		// frame counters (see `ActiveSession::reset_video_stream`).
-		let video_handle_for_resume = video_handle.clone();
-
-		// Start control stream — receives both handles.
-		let control_ctx = ControlStreamContext::new(&context, hdr_effective);
-		control_stream.start(
-			stream_timeout,
-			control_ctx,
-			video_handle,
-			audio_trigger,
-			hdr_metadata_rx,
-		);
+		let (media_stop, controls) = resources.start_media(video_config, video_ctx, audio_ctx, &stop)?;
+		let control_ctx = ControlStreamContext::new(&resources.context);
+		let (controls, control_rx) = watch::channel(controls);
+		control_stream.start(stream_timeout, control_ctx, control_rx, hdr_metadata_rx);
 
 		let sleep_inhibitor = if inhibit_sleep {
 			SleepInhibitor::acquire().await
@@ -341,39 +313,139 @@ impl LaunchedSession {
 			None
 		};
 
-		Ok((
-			ActiveSession {
-				context,
-				av_ping_token,
-				_application: application,
-				video_handle: video_handle_for_resume,
-				sleep_inhibitor,
+		Ok(ActiveSession {
+			resources,
+			media_stop,
+			controls,
+			_sleep_inhibitor: sleep_inhibitor,
+		})
+	}
+}
+
+impl SessionResources {
+	fn start_media(
+		&mut self,
+		video_config: VideoStreamConfig,
+		video_ctx: VideoStreamContext,
+		audio_ctx: AudioStreamContext,
+		session_stop: &ShutdownManager<SessionShutdownReason>,
+	) -> Result<(ShutdownManager<SessionShutdownReason>, MediaControls), ()> {
+		let hdr_requested = video_ctx.dynamic_range == VideoDynamicRange::Hdr;
+		let audio_layout = (audio_ctx.audio_config.channels, audio_ctx.audio_config.channel_mask);
+		let delay = session_stop.delay_shutdown_token().map_err(|e| {
+			tracing::warn!("Cannot start media while the session is stopping: {e:?}");
+		})?;
+		let media_stop = ShutdownManager::new();
+		tokio::spawn({
+			let session_stop = session_stop.clone();
+			let media_stop = media_stop.clone();
+			async move {
+				tokio::select! {
+					reason = session_stop.wait_shutdown_triggered() => {
+						let _ = media_stop.trigger_shutdown(reason);
+					},
+					reason = media_stop.wait_shutdown_triggered() => {
+						if reason != SessionShutdownReason::MediaReplaced {
+							let _ = session_stop.trigger_shutdown(reason);
+						}
+					},
+				}
+				media_stop.wait_shutdown_complete().await;
+				drop(delay);
+			}
+		});
+
+		let result = (|| {
+			let keys = self.context.keys.clone_rx().expect("session keys not initialized");
+			let hdr = self.launched_compositor.hdr() && hdr_requested;
+			let video = self.video_stream.start(
+				video_config,
+				video_ctx,
+				self.av_ping_token,
+				keys.clone(),
+				media_stop.clone(),
+			)?;
+			let audio = self
+				.audio
+				.start(audio_ctx, self.av_ping_token, keys, media_stop.clone())?;
+			Ok(MediaControls { video, audio, hdr })
+		})();
+		match result {
+			Ok(controls) => {
+				self.context.hdr = hdr_requested;
+				(self.context.audio_channels, self.context.audio_channel_mask) = audio_layout;
+				Ok((media_stop, controls))
 			},
-			video_start,
-			audio_start,
-		))
+			Err(()) => {
+				let _ = media_stop.trigger_shutdown(SessionShutdownReason::MediaStartFailed);
+				Err(())
+			},
+		}
+	}
+}
+
+pub(crate) struct MediaControls {
+	pub video: VideoStreamHandle,
+	audio: StartSignal,
+	pub hdr: bool,
+}
+
+impl MediaControls {
+	pub fn trigger(&self) {
+		self.video.trigger();
+		self.audio.trigger();
 	}
 }
 
 /// Active session state — streams are active.
 pub(crate) struct ActiveSession {
-	context: SessionContext,
-	av_ping_token: AvPingToken,
-	_application: Application,
-	video_handle: VideoStreamHandle,
+	resources: SessionResources,
+	media_stop: ShutdownManager<SessionShutdownReason>,
+	controls: watch::Sender<MediaControls>,
 	/// Held while the session is active to keep the host awake; dropped on teardown.
-	#[allow(dead_code)]
-	sleep_inhibitor: Option<SleepInhibitor>,
+	_sleep_inhibitor: Option<SleepInhibitor>,
 }
 
 impl ActiveSession {
 	pub(crate) fn context(&self) -> &SessionContext {
-		&self.context
+		&self.resources.context
 	}
 
-	/// Arm a video stream reset (frame counters + forced IDR) for a resuming client.
-	/// It fires once the client's first video PING arrives.
-	pub(crate) fn reset_video_stream(&self) {
-		self.video_handle.request_reset();
+	pub(crate) fn trigger_streams_start(&self) {
+		let controls = self.controls.borrow();
+		controls.video.start_signal().trigger();
+		controls.audio.trigger();
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	pub(crate) async fn resume(
+		&mut self,
+		video_config: VideoStreamConfig,
+		video_ctx: VideoStreamContext,
+		audio_ctx: AudioStreamContext,
+		keys: SessionKeyData,
+		keys_tx: &SessionKeysSender,
+		av_ping_token: AvPingToken,
+		session_stop: &ShutdownManager<SessionShutdownReason>,
+		timeout: std::time::Duration,
+	) -> Result<(), ()> {
+		// Drain the old workers before changing keys, and before two generations
+		// could read from the same socket or compositor frame receiver.
+		let _ = self.media_stop.trigger_shutdown(SessionShutdownReason::MediaReplaced);
+		tokio::time::timeout(timeout, self.media_stop.wait_shutdown_complete())
+			.await
+			.map_err(|_| tracing::error!("Timed out stopping media for resume"))?;
+		if session_stop.is_shutdown_triggered() {
+			return Err(());
+		}
+
+		keys_tx.send_replace(keys);
+		self.resources.av_ping_token = av_ping_token;
+		let (media_stop, controls) = self
+			.resources
+			.start_media(video_config, video_ctx, audio_ctx, session_stop)?;
+		self.media_stop = media_stop;
+		self.controls.send_replace(controls);
+		Ok(())
 	}
 }

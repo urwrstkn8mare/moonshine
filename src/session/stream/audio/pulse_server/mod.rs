@@ -3,7 +3,6 @@ mod commands;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
 use std::time;
 
 use async_shutdown::ShutdownManager;
@@ -31,8 +30,8 @@ pub(crate) const DEFAULT_CLOCK_RATE_HZ: u32 = 200;
 
 const SINK_NAME: &str = "moonshine";
 
-/// Pre-allocated zero-volume slice for muted streams (up to 8 channels).
-const ZERO_VOL: [f32; 8] = [0.0; 8];
+const MAX_SINK_CHANNELS: usize = AudioChannels::Surround71 as usize;
+const ZERO_VOL: [f32; MAX_SINK_CHANNELS] = [0.0; MAX_SINK_CHANNELS];
 
 /// A buffer of interleaved f32 samples ready for Opus encoding.
 pub(crate) struct AudioFrame {
@@ -41,6 +40,30 @@ pub(crate) struct AudioFrame {
 
 	/// Capture timestamp in milliseconds since process start.
 	pub capture_ts_ms: u64,
+}
+
+/// One media generation's capture destination and frame layout.
+pub(super) struct CaptureOutput {
+	pub channels: AudioChannels,
+	pub packet_duration_ms: u32,
+	pub frame_tx: crossbeam_channel::Sender<AudioFrame>,
+	pub frame_recycle_rx: crossbeam_channel::Receiver<AudioFrame>,
+	pub stop: ShutdownManager<SessionShutdownReason>,
+}
+
+impl CaptureOutput {
+	fn clock_rate_hz(&self) -> u32 {
+		match self.packet_duration_ms {
+			5 | 10 => 1000 / self.packet_duration_ms,
+			0 => DEFAULT_CLOCK_RATE_HZ,
+			duration => {
+				tracing::warn!(
+					"Unsupported packet_duration_ms {duration}, falling back to default {DEFAULT_CLOCK_RATE_HZ}Hz"
+				);
+				DEFAULT_CLOCK_RATE_HZ
+			},
+		}
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +79,7 @@ struct PlaybackStream {
 	state: StreamState,
 	buffer_attr: pulse::stream::BufferAttr,
 	buffer: PlaybackBuffer,
-	volume: Vec<f32>,
+	volume: [f32; MAX_SINK_CHANNELS],
 	muted: bool,
 	/// Bytes consumed by the audio clock since the last REQUEST was sent.
 	/// Grows on every successful drain. Zeroed atomically when a REQUEST is issued.
@@ -156,9 +179,25 @@ struct ServerState {
 	default_format_info: pulse::FormatInfo,
 	next_playback_channel_index: u32,
 	next_stream_index: u32,
-	sink_volume: Vec<f32>,
+	sink_volume: [f32; MAX_SINK_CHANNELS],
 	sink_muted: bool,
 	sink_spec: SinkSpec,
+}
+
+impl ServerState {
+	fn apply_sink_layout(&mut self) {
+		let channels = self.sink_spec.channels;
+		let sample_spec = self.sink_spec.as_pulse_spec();
+		self.server_info.sample_spec = sample_spec;
+		self.server_info.channel_map = channels.map();
+
+		let sink = &mut self.sinks[0];
+		sink.sample_spec = sample_spec;
+		sink.channel_map = channels.map();
+		sink.cvolume = commands::linear_to_cvolume(&self.sink_volume[..channels as usize]);
+		sink.ports[0].name = channels.port_as_cstr().into();
+		sink.formats[0] = self.default_format_info.clone();
+	}
 }
 
 pub(crate) struct PulseServer {
@@ -166,8 +205,8 @@ pub(crate) struct PulseServer {
 	poll: mio::Poll,
 	clock: mio_timerfd::TimerFd,
 
-	frame_tx: crossbeam_channel::Sender<AudioFrame>,
-	frame_recycle_rx: crossbeam_channel::Receiver<AudioFrame>,
+	output: CaptureOutput,
+	output_rx: crossbeam_channel::Receiver<CaptureOutput>,
 	spare_frame: Option<AudioFrame>,
 
 	clients: BTreeMap<mio::Token, Client>,
@@ -198,113 +237,94 @@ fn pop_missing(missing: &mut i64, requested: &mut usize, min_req: usize, in_preb
 	l
 }
 
+fn sink_format_info(channels: AudioChannels) -> pulse::FormatInfo {
+	let mut props = pulse::Props::new();
+	props.set(pulse::Prop::FormatChannels, channels.count_as_cstr());
+	props.set(pulse::Prop::FormatChannelMap, channels.map_cstr());
+	props.set(pulse::Prop::FormatSampleFormat, c"float32le");
+	props.set(
+		pulse::Prop::FormatRate,
+		std::ffi::CString::new(SINK_SAMPLE_RATE.to_string()).unwrap(),
+	);
+	pulse::FormatInfo {
+		encoding: pulse::FormatEncoding::Pcm,
+		props,
+	}
+}
+
 impl PulseServer {
-	pub fn spawn(
+	pub(super) fn spawn(
 		listener: std::os::unix::net::UnixListener,
-		_socket_path: PathBuf,
-		sink_channels: AudioChannels,
-		packet_duration_ms: u32,
-		frame_tx: crossbeam_channel::Sender<AudioFrame>,
-		frame_recycle_rx: crossbeam_channel::Receiver<AudioFrame>,
+		output: CaptureOutput,
 		stop: ShutdownManager<SessionShutdownReason>,
-	) -> Result<(), Error> {
+	) -> Result<crossbeam_channel::Sender<CaptureOutput>, Error> {
 		listener.set_nonblocking(true)?;
 		let listener = UnixListener::from_std(listener);
 		let poll = mio::Poll::new()?;
 
-		let clock_rate_hz = match packet_duration_ms {
-			5 | 10 => 1000 / packet_duration_ms,
-			_ => {
-				if packet_duration_ms != 0 {
-					tracing::warn!(
-						"Unsupported packet_duration_ms {}, falling back to default {}Hz",
-						packet_duration_ms,
-						DEFAULT_CLOCK_RATE_HZ,
-					);
-				}
-				DEFAULT_CLOCK_RATE_HZ
-			},
-		};
-
+		let clock_rate_hz = output.clock_rate_hz();
+		let sink_channels = output.channels;
 		let mut clock = mio_timerfd::TimerFd::new(mio_timerfd::ClockId::Monotonic)?;
 		clock.set_timeout_interval(&time::Duration::from_nanos(1_000_000_000 / clock_rate_hz as u64))?;
 
 		let sink_name = std::ffi::CString::new(SINK_NAME).unwrap();
 
-		let sink_spec = SinkSpec::new(sink_channels);
+		let (output_tx, output_rx) = crossbeam_channel::unbounded();
 
 		let mut dummy_sink = pulse::SinkInfo::new_dummy(1);
 		dummy_sink.name = sink_name.clone();
 		dummy_sink.description = Some(std::ffi::CString::new("Moonshine virtual output").unwrap());
-		dummy_sink.sample_spec = sink_spec.as_pulse_spec();
-		dummy_sink.channel_map = sink_channels.map();
 		dummy_sink.base_volume = pulse::Volume::NORM;
-		dummy_sink.cvolume = pulse::ChannelVolume::norm(sink_channels as u8);
 
 		let server_info = pulse::ServerInfo {
 			server_name: Some(std::ffi::CString::new("Moonshine").unwrap()),
 			server_version: Some(std::ffi::CString::new(env!("CARGO_PKG_VERSION")).unwrap()),
 			host_name: Some(std::ffi::CString::new("moonshine").unwrap()),
-			default_sink_name: Some(sink_name.clone()),
+			default_sink_name: Some(sink_name),
 			default_source_name: Some(std::ffi::CString::new("").unwrap()),
-			sample_spec: sink_spec.as_pulse_spec(),
-			channel_map: sink_channels.map(),
 			..Default::default()
 		};
 
-		dummy_sink.ports[0].name = sink_channels.port_as_cstr().into();
 		dummy_sink.ports[0].port_type = pulse::port_info::PortType::Network;
 		dummy_sink.ports[0].description = Some(std::ffi::CString::new("virtual output").unwrap());
 
-		let mut format_props = pulse::Props::new();
-		format_props.set(pulse::Prop::FormatChannels, sink_channels.count_as_cstr());
-		format_props.set(pulse::Prop::FormatChannelMap, sink_channels.map_cstr());
-		format_props.set(pulse::Prop::FormatSampleFormat, c"float32le");
-		format_props.set(
-			pulse::Prop::FormatRate,
-			std::ffi::CString::new(SINK_SAMPLE_RATE.to_string()).unwrap(),
-		);
-
-		let default_format_info = pulse::FormatInfo {
-			encoding: pulse::FormatEncoding::Pcm,
-			props: format_props,
+		let mut server_state = ServerState {
+			server_info,
+			clock_rate_hz,
+			sinks: vec![dummy_sink],
+			default_format_info: sink_format_info(sink_channels),
+			next_playback_channel_index: 0,
+			next_stream_index: 0,
+			sink_volume: [1.0; MAX_SINK_CHANNELS],
+			sink_muted: false,
+			sink_spec: SinkSpec::new(sink_channels),
 		};
-
-		dummy_sink.formats[0] = default_format_info.clone();
+		server_state.apply_sink_layout();
 
 		let server = Self {
 			listener,
 			poll,
 			clock,
-			frame_tx,
-			frame_recycle_rx,
+			output,
+			output_rx,
 			spare_frame: None,
 			clients: BTreeMap::new(),
-			server_state: ServerState {
-				server_info,
-				clock_rate_hz,
-				sinks: vec![dummy_sink],
-				default_format_info,
-				next_playback_channel_index: 0,
-				next_stream_index: 0,
-				sink_volume: vec![1.0; sink_channels as usize],
-				sink_muted: false,
-				sink_spec,
-			},
+			server_state,
 			epoch: time::Instant::now(),
 		};
 
+		let delay_stop = stop.delay_shutdown_token()?;
 		std::thread::Builder::new()
 			.name("pulse-server".to_string())
 			.spawn(move || {
-				if let Err(e) = server.run(stop.clone()) {
+				let _delay_stop = delay_stop;
+				let _stop_token = stop.trigger_shutdown_token(SessionShutdownReason::PulseServerStopped);
+				if let Err(e) = server.run(stop) {
 					tracing::error!("PulseServer error: {e}");
-					let _ = stop.trigger_shutdown(SessionShutdownReason::PulseServerStopped);
 				}
-			})
-			.expect("Failed to spawn pulse server thread");
+			})?;
 
-		Ok(())
+		Ok(output_tx)
 	}
 
 	fn run(mut self, stop: ShutdownManager<SessionShutdownReason>) -> Result<(), Error> {
@@ -533,29 +553,60 @@ impl PulseServer {
 		}
 	}
 
+	fn reconfigure_output(&mut self, output: CaptureOutput) -> Result<(), Error> {
+		let clock_rate_hz = output.clock_rate_hz();
+		if self.server_state.clock_rate_hz != clock_rate_hz {
+			self.clock
+				.set_timeout_interval(&time::Duration::from_nanos(1_000_000_000 / clock_rate_hz as u64))?;
+			self.server_state.clock_rate_hz = clock_rate_hz;
+		}
+		if self.server_state.sink_spec.channels != output.channels {
+			self.server_state.sink_spec.channels = output.channels;
+			self.server_state.default_format_info = sink_format_info(output.channels);
+			self.server_state.apply_sink_layout();
+			for client in self.clients.values_mut() {
+				for stream in client.playback_streams.values_mut() {
+					stream.buffer.set_sink_channels(output.channels);
+				}
+			}
+		}
+		self.output = output;
+		Ok(())
+	}
+
 	fn clock_tick(&mut self) -> Result<(), Error> {
+		// Only the Pulse thread switches output, at a clock boundary. The
+		// clients, byte queues, request credits and stream state stay in place.
+		if let Some(output) = self.output_rx.try_iter().last() {
+			self.reconfigure_output(output)?;
+		}
+		if self.output.stop.is_shutdown_triggered() {
+			return Ok(());
+		}
+
 		let mut done_draining = Vec::new();
 
 		let capture_ts = self.epoch.elapsed().as_millis() as u64;
+		let sink_channels = self.server_state.sink_spec.channels as usize;
 		let num_frames = self.server_state.sink_spec.sample_rate / self.server_state.clock_rate_hz;
-		let encode_len = num_frames * self.server_state.sink_spec.channels as u32;
+		let encode_len = num_frames as usize * sink_channels;
 
-		let mut frame = match self.frame_recycle_rx.try_recv() {
+		let mut frame = match self.output.frame_recycle_rx.try_recv() {
 			Ok(mut frame) => {
-				frame.buf.resize(encode_len as usize, 0.0);
+				frame.buf.resize(encode_len, 0.0);
 				frame.buf.fill(0.0);
 				frame
 			},
 			Err(crossbeam_channel::TryRecvError::Empty) => {
 				if let Some(mut frame) = self.spare_frame.take() {
-					frame.buf.resize(encode_len as usize, 0.0);
+					frame.buf.resize(encode_len, 0.0);
 					frame.buf.fill(0.0);
 					frame
 				} else {
-					// Recycle pool temporarily exhausted; allocate a fresh frame to avoid
-					// deadlocking the encoder which is blocked on frame_rx.recv().
+					// Recycle pool temporarily exhausted; allocate a fresh frame rather
+					// than waiting while the encoder may itself be waiting for audio.
 					AudioFrame {
-						buf: vec![0.0; encode_len as usize],
+						buf: vec![0.0; encode_len],
 						capture_ts_ms: 0,
 					}
 				}
@@ -573,15 +624,15 @@ impl PulseServer {
 					let buffer_len = stream.buffer.len_bytes();
 
 					let drained = if stream.muted {
+						stream
+							.buffer
+							.drain_and_mix(num_frames as usize, &mut frame.buf, &ZERO_VOL[..sink_channels])
+					} else {
 						stream.buffer.drain_and_mix(
 							num_frames as usize,
 							&mut frame.buf,
-							&ZERO_VOL[..stream.volume.len()],
+							&stream.volume[..sink_channels],
 						)
-					} else {
-						stream
-							.buffer
-							.drain_and_mix(num_frames as usize, &mut frame.buf, &stream.volume)
 					};
 
 					if !drained {
@@ -664,15 +715,15 @@ impl PulseServer {
 		// Apply sink-level volume.
 		if self.server_state.sink_muted {
 			frame.buf.fill(0.0);
-		} else if self.server_state.sink_volume.iter().any(|&v| v != 1.0) {
-			let vol = &self.server_state.sink_volume;
+		} else if self.server_state.sink_volume[..sink_channels].iter().any(|&v| v != 1.0) {
+			let vol = &self.server_state.sink_volume[..sink_channels];
 			for (i, sample) in frame.buf.iter_mut().enumerate() {
 				*sample *= vol[i % vol.len()];
 			}
 		}
 
 		frame.capture_ts_ms = capture_ts;
-		match self.frame_tx.try_send(frame) {
+		match self.output.frame_tx.try_send(frame) {
 			Ok(()) => {},
 			Err(crossbeam_channel::TrySendError::Full(frame)) => {
 				// Encoder is behind; stash the frame so we don't lose the allocation.

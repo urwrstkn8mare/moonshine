@@ -4,9 +4,9 @@ use arrayvec::ArrayVec;
 use byteorder::{BigEndian as BE, LittleEndian as LE, ReadBytesExt as _};
 use pulse::sample_spec::MAX_CHANNELS;
 use pulseaudio::protocol::{self as pulse, ChannelPosition};
-use rubato::Resampler;
 use rubato::audioadapter::AdapterMut;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Resampler, Resizable};
 
 use crate::session::stream::audio::{AudioChannels, SinkSpec};
 
@@ -79,6 +79,10 @@ impl PlaybackBuffer {
 		self.stream_spec
 	}
 
+	pub(super) fn set_sink_channels(&mut self, channels: AudioChannels) {
+		self.sink_spec.channels = channels;
+	}
+
 	fn buffer(&self) -> &Buffer {
 		&self.buffer
 	}
@@ -128,15 +132,23 @@ impl PlaybackBuffer {
 				input_frames,
 				resampled_frames,
 			} => {
-				if resampler.output_frames_max() != num_frames {
-					match new_resampler(self.stream_spec, self.sink_spec, num_frames) {
-						Ok(new) => **resampler = new,
-						Err(err) => {
-							tracing::error!("Failed to rebuild the audio resampler: {err}");
-							return false;
-						},
+				let channels_changed = resampler.nbr_channels() != sink_channels as usize;
+				if channels_changed || resampler.output_frames_next() != num_frames {
+					if channels_changed || resampler.output_frames_max() < num_frames {
+						// The raw playback queue is independent of the sink layout. Only
+						// the conversion stage is replaced when the channel count changes.
+						match new_resampler(self.stream_spec, self.sink_spec, num_frames) {
+							Ok(new) => **resampler = new,
+							Err(err) => {
+								tracing::error!("Failed to rebuild the audio resampler: {err}");
+								return false;
+							},
+						}
+						input_frames.resize(resampler.input_frames_max() * sink_channels as usize, 0.0);
+					} else if let Err(err) = resampler.set_chunk_size(num_frames) {
+						tracing::error!("Failed to resize the audio resampler: {err}");
+						return false;
 					}
-					input_frames.resize(resampler.input_frames_max() * sink_channels as usize, 0.0);
 					resampled_frames.resize(num_frames * sink_channels as usize, 0.0);
 				}
 
@@ -186,15 +198,20 @@ fn new_resampler(
 	stream_spec: pulse::SampleSpec,
 	sink_spec: SinkSpec,
 	num_frames: usize,
-) -> Result<rubato::Async<f32>, rubato::ResamplerConstructionError> {
-	rubato::Async::<f32>::new_sinc(
+) -> Result<rubato::Async<f32>, String> {
+	let mut resampler = rubato::Async::<f32>::new_sinc(
 		sink_spec.sample_rate as f64 / stream_spec.sample_rate as f64,
 		1.0, // The ratio never changes
 		&rubato::SincInterpolationParameters::default(),
-		num_frames,
+		// Size for the largest negotiated packet so 5 ms ↔ 10 ms can keep
+		// the current filter history via set_chunk_size.
+		num_frames.max((sink_spec.sample_rate / 100) as usize),
 		sink_spec.channels as usize,
 		rubato::FixedAsync::Output,
 	)
+	.map_err(|err| err.to_string())?;
+	resampler.set_chunk_size(num_frames).map_err(|err| err.to_string())?;
+	Ok(resampler)
 }
 
 /// Raw bytes from the app, decoded according to the stream's spec.
@@ -491,6 +508,24 @@ mod tests {
 			);
 			assert!(result.is_err(), "rate {rate} was accepted");
 		}
+	}
+
+	#[test]
+	fn changing_sink_layout_and_duration_preserves_queued_playback() {
+		let mut buf = playback(f32_stream(2, 44100), pulse::ChannelMap::stereo(), AudioChannels::Stereo);
+		write_f32(&mut buf, 2_000, |_| vec![0.25, -0.125]);
+		assert!(buf.drain_and_mix(240, &mut [0.0; 240 * 2], &[1.0; 2]));
+		let queued = buf.len_bytes();
+
+		buf.set_sink_channels(AudioChannels::Surround51);
+		assert_eq!(buf.len_bytes(), queued);
+		let mut out = [0.0; 480 * 6];
+		assert!(buf.drain_and_mix(480, &mut out, &[1.0; 6]));
+		assert!(buf.len_bytes() < queued);
+		let last_frame = &out[out.len() - 6..];
+		assert!((last_frame[0] - 0.25).abs() < 0.001);
+		assert!((last_frame[1] + 0.125).abs() < 0.001);
+		assert_eq!(&last_frame[2..], &[0.0; 4]);
 	}
 
 	/// After a flush, nothing the resampler's filter still held may leak into the next audio.

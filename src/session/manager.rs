@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -14,10 +15,11 @@ use crate::session::SessionKeysSender;
 use crate::session::SessionState;
 use crate::session::compositor::CompositorConfig;
 use crate::session::stream::AvPingToken;
-use crate::session::stream::StartSignal;
+use crate::session::stream::audio::AudioChannels;
 use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStreamConfig;
+use crate::session::stream::video::VideoDynamicRange;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
 use crate::session::stream::video::{StatsSender, StreamEvent, StreamInfo};
@@ -90,6 +92,17 @@ pub enum SessionShutdownReason {
 	InputHandlerStopped,
 	/// Compositor stopped unexpectedly.
 	CompositorStopped,
+	/// The media workers were replaced by a resume; keep the game running.
+	MediaReplaced,
+	/// The negotiated media workers could not start.
+	MediaStartFailed,
+}
+
+struct PendingResume {
+	peer: IpAddr,
+	keys: SessionKeyData,
+	ping_token: AvPingToken,
+	audio_layout: Option<(AudioChannels, u32)>,
 }
 
 struct SessionManagerInner {
@@ -132,20 +145,14 @@ struct SessionManagerInner {
 	keys_tx: Option<SessionKeysSender>,
 
 	/// Stream contexts received via RTSP ANNOUNCE, consumed by `start_session`.
-	video_stream_context: Option<VideoStreamContext>,
-	audio_stream_context: Option<AudioStreamContext>,
+	stream_contexts: Option<(VideoStreamContext, AudioStreamContext)>,
+	pending_resume: Option<PendingResume>,
 
 	/// Broadcast sender for per-frame encoding statistics.
 	stats_tx: StatsSender,
 
 	/// Watchdog task for monitoring unexpected session shutdowns.
 	stop_watcher: Option<tokio::task::JoinHandle<()>>,
-
-	/// Starts the video pipeline (used by bench / external callers).
-	video_start: Option<StartSignal>,
-
-	/// Starts the audio pipeline (used by bench / external callers).
-	audio_start: Option<StartSignal>,
 
 	/// Certificate fingerprint of the client that launched the current session, if known.
 	session_client: Option<String>,
@@ -174,10 +181,8 @@ impl SessionManagerInner {
 		}
 		self.session = None;
 		self.keys_tx = None;
-		self.video_stream_context = None;
-		self.audio_stream_context = None;
-		self.video_start = None;
-		self.audio_start = None;
+		self.stream_contexts = None;
+		self.pending_resume = None;
 		self.session_client = None;
 		self.session_started = None;
 		self.stop = ShutdownManager::new();
@@ -245,12 +250,10 @@ impl SessionManager {
 			session: None,
 			stop: ShutdownManager::new(),
 			keys_tx: None,
-			video_stream_context: None,
-			audio_stream_context: None,
+			stream_contexts: None,
+			pending_resume: None,
 			stats_tx: StatsSender::new(256),
 			stop_watcher: None,
-			video_start: None,
-			audio_start: None,
 			session_client: None,
 			session_started: None,
 			shutdown: shutdown.clone(),
@@ -288,8 +291,8 @@ impl SessionManager {
 	/// that have no Moonlight client. Must be called after `start_session()`.
 	pub async fn trigger_streams_start(&self) {
 		let inner = self.inner.lock().await;
-		for start in [&inner.video_start, &inner.audio_start].into_iter().flatten() {
-			start.trigger();
+		if let Some(SessionState::Active(active)) = &inner.session {
+			active.trigger_streams_start();
 		}
 	}
 
@@ -298,32 +301,39 @@ impl SessionManager {
 		&self,
 		video_stream_context: VideoStreamContext,
 		audio_stream_context: AudioStreamContext,
+		peer: Option<IpAddr>,
 	) -> Result<(), ()> {
 		let mut guard = self.inner.lock().await;
 		match guard.session.as_ref() {
-			Some(SessionState::Launched(_)) => {
-				tracing::debug!("Stream contexts received via RTSP ANNOUNCE.");
-				guard.video_stream_context = Some(video_stream_context);
-				guard.audio_stream_context = Some(audio_stream_context);
-				Ok(())
+			Some(SessionState::Launched(_)) => {},
+			Some(SessionState::Active(active)) => {
+				if !guard
+					.pending_resume
+					.as_ref()
+					.is_some_and(|resume| Some(resume.peer) == peer)
+				{
+					tracing::warn!("Rejecting RTSP ANNOUNCE without a matching resume request");
+					return Err(());
+				}
+				// The game and the Ferriscope output stay alive. Ferriscope cannot
+				// resize the output or raise its refresh rate in place.
+				let launch = active.context();
+				if (video_stream_context.width, video_stream_context.height) != launch.resolution
+					|| video_stream_context.fps > launch.refresh_rate
+					|| (video_stream_context.dynamic_range == VideoDynamicRange::Hdr) != launch.hdr
+				{
+					guard.stream_contexts = None;
+					tracing::warn!("Cannot change resolution, HDR mode, or exceed the launch refresh rate on resume");
+					return Err(());
+				}
 			},
-			Some(SessionState::Initialized(_)) => {
-				tracing::warn!("SetStreamContext rejected: session not yet launched (Initialized state)");
-				Err(())
-			},
-			Some(SessionState::Active(_)) => {
-				// Client is resuming an already-running session (reconnect). The video,
-				// audio, and control streams are still running and re-learn the client's
-				// address from its PINGs (with refreshed keys via `/resume`), so there is
-				// nothing to rebuild — accept the re-ANNOUNCE without storing new contexts.
-				tracing::info!("Resuming active session: accepting RTSP ANNOUNCE from reconnecting client.");
-				Ok(())
-			},
-			None => {
-				tracing::warn!("SetStreamContext rejected: no active session");
-				Err(())
+			_ => {
+				tracing::warn!("Rejecting RTSP ANNOUNCE without a launched session");
+				return Err(());
 			},
 		}
+		guard.stream_contexts = Some((video_stream_context, audio_stream_context));
+		Ok(())
 	}
 
 	/// A snapshot of the current session, if there is one.
@@ -335,12 +345,17 @@ impl SessionManager {
 			SessionState::Launched(_) => SessionPhase::Launched,
 			SessionState::Active(_) => SessionPhase::Active,
 		};
+		let stream = self.stats_tx.join().0;
+		let mut context = session.context().clone();
+		if let Some(stream) = &stream {
+			context.refresh_rate = stream.fps;
+		}
 		Some(SessionStatus {
 			phase,
-			context: session.context().clone(),
+			context,
 			client: guard.session_client.clone(),
 			started: guard.session_started.unwrap_or_else(SystemTime::now),
-			stream: self.stats_tx.join().0,
+			stream,
 		})
 	}
 
@@ -369,8 +384,25 @@ impl SessionManager {
 		Ok(guard.session.as_ref().map(|s| s.context().clone()))
 	}
 
-	pub(crate) async fn av_ping_token(&self) -> Option<AvPingToken> {
-		self.inner.lock().await.session.as_ref().map(SessionState::av_ping_token)
+	pub(crate) async fn av_ping_token(&self, peer: IpAddr) -> Option<AvPingToken> {
+		let guard = self.inner.lock().await;
+		match guard.pending_resume.as_ref() {
+			Some(resume) if resume.peer == peer => Some(resume.ping_token),
+			_ => guard.session.as_ref().map(SessionState::av_ping_token),
+		}
+	}
+
+	pub(crate) async fn requested_audio_layout(&self, peer: IpAddr) -> Option<(AudioChannels, u32)> {
+		let guard = self.inner.lock().await;
+		guard
+			.pending_resume
+			.as_ref()
+			.filter(|resume| resume.peer == peer)
+			.and_then(|resume| resume.audio_layout)
+			.or_else(|| {
+				let ctx = guard.session.as_ref()?.context();
+				Some((ctx.audio_channels, ctx.audio_channel_mask))
+			})
 	}
 
 	/// Initialize a new session with the provided context.
@@ -468,77 +500,79 @@ impl SessionManager {
 		}
 	}
 
-	/// Start the video and audio streams.
-	///
-	/// Returns `Ok(())` only after all three streams (video, audio, control) are
-	/// successfully constructed. Returns `Err(())` if any stream fails to initialize.
-	pub async fn start_session(&self) -> Result<(), ()> {
-		let (launched, video_stream_context, audio_stream_context, stop) = {
-			let mut guard = self.inner.lock().await;
-			let video_stream_context = guard.video_stream_context.take();
-			let audio_stream_context = guard.audio_stream_context.take();
-			match guard.session.take() {
-				Some(SessionState::Launched(launched)) => {
-					(launched, video_stream_context, audio_stream_context, guard.stop.clone())
-				},
-				Some(SessionState::Initialized(session)) => {
-					guard.session = Some(SessionState::Initialized(session));
-					guard.session_started = Some(SystemTime::now());
-					tracing::warn!("StartSession rejected: session not yet launched");
-					return Err(());
-				},
-				Some(SessionState::Active(active)) => {
-					// Resume (reconnect): the streams are already running, so PLAY is a
-					// no-op — the client picks up the existing streams once it PINGs.
-					// The reconnecting client is a fresh Moonlight session that expects
-					// frame numbers to start at 1, so reset the video frame counters and
-					// force an IDR; otherwise it sees the running counter as a huge frame
-					// gap and reports a poor connection. The reset fires on the client's
-					// first video PING, once its new address is known.
-					active.reset_video_stream();
-					guard.session = Some(SessionState::Active(active));
-					tracing::info!(
-						"Resuming active session: resetting video frame counter and treating PLAY as no-op."
-					);
-					return Ok(());
-				},
-				None => {
-					tracing::warn!("StartSession rejected: no active session");
-					return Err(());
-				},
+	/// Start negotiated media, or replace it after an authenticated resume.
+	pub async fn start_session(&self, peer: Option<IpAddr>) -> Result<(), ()> {
+		let mut guard = self.inner.lock().await;
+		let stop = guard.stop.clone();
+		if stop.is_shutdown_triggered() {
+			return Err(());
+		}
+		let video_config = guard.video_config.clone();
+
+		if matches!(guard.session, Some(SessionState::Active(_))) {
+			let Some(resume) = &guard.pending_resume else {
+				// Older clients send one PLAY for each track.
+				return Ok(());
+			};
+			if Some(resume.peer) != peer {
+				return Err(());
 			}
+			let Some((video, audio)) = guard.stream_contexts.take() else {
+				return Err(());
+			};
+			let resume = guard.pending_resume.take().expect("checked pending resume");
+			let keys_tx = guard.keys_tx.as_ref().expect("session keys not initialized").clone();
+			let Some(SessionState::Active(active)) = &mut guard.session else {
+				unreachable!()
+			};
+			tracing::info!(
+				bitrate_kbps = video.bitrate / 1_000,
+				fps = video.fps,
+				"Restarting media for the resumed session."
+			);
+			return active
+				.resume(
+					video_config,
+					video,
+					audio,
+					resume.keys,
+					&keys_tx,
+					resume.ping_token,
+					&stop,
+					std::time::Duration::from_secs(SESSION_SHUTDOWN_TIMEOUT_SECS),
+				)
+				.await;
+		}
+
+		if !matches!(guard.session, Some(SessionState::Launched(_))) {
+			tracing::warn!("Rejecting RTSP PLAY without a launched session");
+			return Err(());
+		}
+		let (video, audio) = guard.stream_contexts.take().ok_or_else(|| {
+			tracing::warn!("Rejecting RTSP PLAY without negotiated stream settings");
+		})?;
+		let Some(SessionState::Launched(launched)) = guard.session.take() else {
+			unreachable!()
 		};
 
-		let video_stream_context = video_stream_context.ok_or_else(|| {
-			tracing::error!("VideoStreamContext not set");
-		})?;
-		let audio_stream_context = audio_stream_context.ok_or_else(|| {
-			tracing::error!("AudioStreamContext not set");
-		})?;
-
 		tracing::info!("Starting session streams.");
-		let mut guard = self.inner.lock().await;
-		let video_config = guard.video_config.clone();
-		let stream_timeout = guard.stream_timeout;
 		match launched
 			.start(
 				video_config,
-				stream_timeout,
-				video_stream_context,
-				audio_stream_context,
-				stop,
+				guard.stream_timeout,
+				video,
+				audio,
+				stop.clone(),
 				guard.inhibit_sleep,
 			)
 			.await
 		{
-			Ok((active, video_start, audio_start)) => {
+			Ok(active) => {
 				guard.session = Some(SessionState::Active(active));
-				guard.video_start = Some(video_start);
-				guard.audio_start = Some(audio_start);
 				Ok(())
 			},
 			Err(()) => {
-				guard.reset_session();
+				let _ = stop.trigger_shutdown(SessionShutdownReason::MediaStartFailed);
 				tracing::error!("Failed to start session streams.");
 				Err(())
 			},
@@ -569,26 +603,26 @@ impl SessionManager {
 		Ok(())
 	}
 
-	/// Update the session keys for the active session.
-	pub(crate) async fn update_keys(&self, keys: SessionKeyData) -> Result<(), ()> {
-		let guard = self.inner.lock().await;
-
-		if guard.stop.is_shutdown_triggered() {
-			tracing::warn!("Session is shutting down; rejecting resume key update.");
+	/// Stage an authenticated resume. Apply it only once RTSP negotiates and plays.
+	pub(crate) async fn prepare_resume(
+		&self,
+		peer: IpAddr,
+		keys: SessionKeyData,
+		audio_layout: Option<(AudioChannels, u32)>,
+	) -> Result<(), ()> {
+		let mut guard = self.inner.lock().await;
+		if guard.stop.is_shutdown_triggered() || !matches!(guard.session, Some(SessionState::Active(_))) {
+			tracing::warn!("Rejecting resume without an active session");
 			return Err(());
 		}
-
-		if !matches!(guard.session.as_ref(), Some(SessionState::Active(_))) {
-			tracing::warn!("No active streaming session to update keys for.");
-			return Err(());
-		}
-
-		if let Some(keys_tx) = &guard.keys_tx {
-			keys_tx.send_replace(keys);
-		} else {
-			tracing::warn!("Active streaming session has no key sender; rejecting resume.");
-			return Err(());
-		}
+		let ping_token = AvPingToken::new()?;
+		guard.stream_contexts = None;
+		guard.pending_resume = Some(PendingResume {
+			peer,
+			keys,
+			ping_token,
+			audio_layout,
+		});
 
 		Ok(())
 	}
