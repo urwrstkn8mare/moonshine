@@ -156,6 +156,9 @@ allowed_networks = ["127.0.0.1/32", "::1/128", "192.168.1.0/24"]
 Set `enabled = false` in the `[ui]` table to turn the control panel off.
 To open it through a reverse proxy, see [TIPS.md](TIPS.md#open-the-control-panel-through-a-reverse-proxy).
 
+Moonshine also shows a moon in the system tray, with a red dot while a device streams. Click it to open the control panel.
+Set `tray = false` in the `[ui]` table to hide it.
+
 ### Pairing with a client
 
 When you connect with Moonlight for the first time, it shows a PIN.

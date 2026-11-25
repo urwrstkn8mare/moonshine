@@ -83,6 +83,10 @@ pub struct UiConfig {
 	/// The IP addresses, `localhost` and this computer's own name always work. Other names are
 	/// refused, so that a website cannot reach the control panel by DNS rebinding.
 	pub allowed_hosts: Vec<String>,
+
+	/// Whether to show a tray icon that shows whether a client streams. Clicking it opens the
+	/// control panel.
+	pub tray: bool,
 }
 
 impl Default for UiConfig {
@@ -92,6 +96,7 @@ impl Default for UiConfig {
 			port: 47990,
 			allowed_networks: vec!["127.0.0.1/32".to_string(), "::1/128".to_string()],
 			allowed_hosts: Vec::new(),
+			tray: true,
 		}
 	}
 }

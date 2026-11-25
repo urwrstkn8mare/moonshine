@@ -13,6 +13,8 @@ pub mod session;
 pub(crate) mod state;
 pub mod stats_socket;
 pub mod tls;
+#[cfg(feature = "tray")]
+pub mod tray;
 #[cfg(feature = "ui")]
 pub mod ui;
 pub mod webserver;
