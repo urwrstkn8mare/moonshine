@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Keep the stream within the bitrate the client asks for: video is encoded below it, so FEC, audio and packet overhead fit inside it, as Sunshine does.
+- Stream audio and video to clients that send Sunshine's ping payload (`X-SS-Ping-Payload`), such as recent Moonlight builds, instead of ignoring their pings and sending nothing; legacy `PING` packets still work.
 - Refuse a PIN for a pairing request that already has one, or that asked more than 5 minutes ago, instead of answering that it was accepted while nothing paired.
 - Finish pairing when the PIN arrives right after the pairing request, instead of waiting forever.
 - Refuse a PIN on `/submit-pin` that is not 4 digits, as the control panel does.

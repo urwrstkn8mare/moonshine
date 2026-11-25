@@ -218,7 +218,11 @@ impl RtspServer {
 			.build(Vec::new())
 	}
 
-	fn handle_setup_request(&self, request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> rtsp_types::Response<Vec<u8>> {
+	async fn handle_setup_request(
+		&self,
+		request: &rtsp_types::Request<Vec<u8>>,
+		cseq: i32,
+	) -> rtsp_types::Response<Vec<u8>> {
 		let transports = match request.typed_header::<rtsp_types::headers::Transports>() {
 			Ok(transports) => transports,
 			Err(e) => {
@@ -273,11 +277,18 @@ impl RtspServer {
 
 					tracing::debug!("Responding with server_port={port} for stream '{stream_id}'.");
 
-					return rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
+					let mut response = rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 						.header(headers::CSEQ, cseq.to_string())
 						.header(headers::SESSION, "MoonshineSession;timeout = 90".to_string())
-						.header(headers::TRANSPORT, format!("server_port={port}"))
-						.build(Vec::new());
+						.header(headers::TRANSPORT, format!("server_port={port}"));
+					if stream_id != "control" {
+						let Some(token) = self.session_manager.av_ping_token().await else {
+							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::SessionNotFound);
+						};
+						let name = headers::HeaderName::from_static_str("X-SS-Ping-Payload").unwrap();
+						response = response.header(name, token.as_str());
+					}
+					return response.build(Vec::new());
 				},
 				t => {
 					tracing::warn!("Received request for unsupported transport: {:?}", t);
@@ -618,7 +629,7 @@ impl RtspServer {
 					Method::Announce => self.handle_announce_request(request, cseq).await,
 					Method::Describe => self.handle_describe_request(request, cseq).await,
 					Method::Options => self.handle_options_request(request, cseq),
-					Method::Setup => self.handle_setup_request(request, cseq),
+					Method::Setup => self.handle_setup_request(request, cseq).await,
 					Method::Play => self.handle_play_request(request, cseq).await,
 					method => {
 						tracing::warn!("Received request with unsupported method {:?}", method);

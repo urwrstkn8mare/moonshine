@@ -10,7 +10,7 @@ use crate::session::SessionKeysReceiver;
 use crate::session::compositor::CompositorFrames;
 use crate::session::compositor::frame::HdrModeState;
 use crate::session::manager::SessionShutdownReason;
-use crate::session::stream::{StartSignal, StartWaiter};
+use crate::session::stream::{AvPingToken, StartSignal, StartWaiter};
 
 mod gso_socket;
 mod packetizer;
@@ -559,6 +559,7 @@ impl VideoStream {
 		self,
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
+		av_ping_token: AvPingToken,
 		keys_rx: SessionKeysReceiver,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<VideoStreamHandle, ()> {
@@ -605,6 +606,7 @@ impl VideoStream {
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
+			av_ping_token,
 			start.waiter(),
 			reset_tx.clone(),
 			resume_pending.clone(),
@@ -642,6 +644,7 @@ impl VideoStream {
 fn spawn_handle_video_packets(
 	mut packet_rx: mpsc::Receiver<PacketBatch>,
 	socket: UdpGsoSocket,
+	av_ping_token: AvPingToken,
 	mut start: StartWaiter,
 	reset_tx: broadcast::Sender<u32>,
 	resume_pending: Arc<AtomicBool>,
@@ -718,7 +721,7 @@ fn spawn_handle_video_packets(
 						Err(_) => break,
 					};
 
-					if &buf[..len] == b"PING" {
+					if av_ping_token.matches(&buf[..len]) {
 						tracing::trace!("Received video stream PING message from {address}.");
 						client_address = Some(address);
 
@@ -753,6 +756,7 @@ mod tests {
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
+			AvPingToken::new().unwrap(),
 			start.waiter(),
 			reset_tx,
 			Arc::new(AtomicBool::new(false)),
@@ -763,6 +767,39 @@ mod tests {
 		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
 			.await
 			.expect("packet handler kept its socket after shutdown");
+	}
+
+	#[tokio::test]
+	async fn av_ping_from_resuming_client_triggers_video_reset() {
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let address = socket.local_addr().unwrap();
+		let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let (_packet_tx, packet_rx) = mpsc::channel(1);
+		let (reset_tx, mut reset_rx) = broadcast::channel(1);
+		let start = StartSignal::new();
+		let stop = ShutdownManager::new();
+		let token = AvPingToken::new().unwrap();
+		spawn_handle_video_packets(
+			packet_rx,
+			socket,
+			token,
+			start.waiter(),
+			reset_tx,
+			Arc::new(AtomicBool::new(true)),
+			stop.clone(),
+		);
+
+		start.trigger();
+		let mut ping = [0; 20];
+		ping[..16].copy_from_slice(token.as_str().as_bytes());
+		ping[16..].copy_from_slice(&1u32.to_be_bytes());
+		client.send_to(&ping, address).await.unwrap();
+		let epoch = tokio::time::timeout(std::time::Duration::from_secs(1), reset_rx.recv())
+			.await
+			.expect("video handler did not accept the session's ping")
+			.unwrap();
+		assert_eq!(epoch, 1);
+		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
 	}
 
 	#[tokio::test]
@@ -778,6 +815,7 @@ mod tests {
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
+			AvPingToken::new().unwrap(),
 			start.waiter(),
 			reset_tx,
 			Arc::new(AtomicBool::new(false)),
